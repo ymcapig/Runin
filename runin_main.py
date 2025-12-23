@@ -58,6 +58,7 @@ class ODM_RunIn_Project(BaseRunInApp):
             self.log(f"Step 0: Waiting for Battery > {threshold}%...")
             
             while True:
+                self.check_stop()
                 try:
                     bat = psutil.sensors_battery()
                     if bat:
@@ -81,6 +82,7 @@ class ODM_RunIn_Project(BaseRunInApp):
                     self.log(f"Error reading battery: {e}")
 
                 # 等待 60 秒 (1分鐘) 再檢查
+                self.check_stop()
                 time.sleep(5)
             
         # Step 1: 單燒
@@ -100,7 +102,7 @@ class ODM_RunIn_Project(BaseRunInApp):
         # Step 3: 雙燒
         if start_from_step <= 3:
             self.log("[Test 3] Dual Stress")
-            self.exec_cmd_wait(r"call %HOME%process\RI\Thermal_Dual.bat")
+            self.exec_cmd_wait(r"call .\RI\Thermal_Dual.bat")
             self.log("Block 1 PASS. Rebooting to Block 2...")
             self.save_state("2", 0)
             self.trigger_reboot()
@@ -143,6 +145,7 @@ class ODM_RunIn_Project(BaseRunInApp):
         self.exec_cmd_wait(r"call .\RI\Battery_Cycling_Test.bat")
 
 if __name__ == "__main__":
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
     os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
