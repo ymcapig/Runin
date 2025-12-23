@@ -1,4 +1,4 @@
-﻿import sys
+import sys
 import os
 import time
 import subprocess
@@ -34,12 +34,14 @@ class RunInWorker(QThread):
             self.sig_finished.emit(False)
 
 class BaseRunInApp(QMainWindow):
+    sig_update_ui_log = pyqtSignal(str)
+
     def __init__(self, title="ODM Run-In Framework (PyQt5)"):
         super().__init__()
         self.setWindowTitle(title)
         self.resize(600, 500)
-        self.state_file = "C:\\runin_state.json"
-        
+        self.state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runin_state.json")
+        self.sig_update_ui_log.connect(self.append_log_text)
         # UI Setup
         central = QWidget()
         self.setCentralWidget(central)
@@ -82,12 +84,13 @@ class BaseRunInApp(QMainWindow):
         raise NotImplementedError
 
     def log(self, msg):
-            # 寫入文字
-            self.txt_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
-            # 1. 強制捲動到底部 (避免捲軸卡住導致渲染錯誤)
+        self.sig_update_ui_log.emit(msg)
+        print(msg)
+
+    def append_log_text(self, msg):
+            timestamp = datetime.now().strftime('%H:%M:%S')
+            self.txt_log.append(f"[{timestamp}] {msg}")
             self.txt_log.ensureCursorVisible()
-            # 2. 強制處理 UI 事件 (讓介面有機會重繪)
-            QApplication.processEvents()
 
     def exec_cmd_wait(self, cmd, timeout=None):
         """
