@@ -1,13 +1,10 @@
-﻿import sys
+import sys
 import os
 import time
 import psutil 
 from PyQt5.QtWidgets import QApplication
 from core import BaseRunInApp
 from PyQt5.QtCore import Qt
-# 設定環境路徑
-# 測試時可指向您的模擬資料夾，正式上線請改為 r"C:\FXNDiag\\"
-os.environ["HOME"] = r"C:\FXNDiag\\"
 
 class ODM_RunIn_Project(BaseRunInApp):
 
@@ -89,13 +86,13 @@ class ODM_RunIn_Project(BaseRunInApp):
         # Step 1: 單燒
         if start_from_step <= 1:
             self.log("[Test 1] Single Stress")
-            self.exec_cmd_wait(r"call %HOME%process\RI\Thermal_Single.bat")
+            self.exec_cmd_wait(r"call .\RI\Thermal_Single.bat")
             self.save_state("1", 2)
 
         # Step 2: Fan
         if start_from_step <= 2:
             self.log("[Test 2] Fan Max Speed")
-            self.exec_cmd_wait(r"call %HOME%process\RI\Thermal_Fan.bat")
+            self.exec_cmd_wait(r"call .\RI\Thermal_Fan.bat")
             self.log("Rebooting for Test 3...")
             self.save_state("1", 3)
             self.trigger_reboot()
@@ -113,20 +110,20 @@ class ODM_RunIn_Project(BaseRunInApp):
         self.log("--- Block 2: Aging Test ---")
         
         items = [
-            ("call %HOME%process\\RI\\BatteryInfo.bat", False),
-            ("call %HOME%process\\RI\\Battery.bat", False),
-            ("call %HOME%process\\RI\\TurnOnOff.bat", False),
-            ("call %HOME%process\\RI\\RICamera.bat", False),
-            ("call %HOME%process\\RI\\ColdBoot.bat", True),
-            ("call %HOME%process\\RI\\RTC.bat", True),
-            ("call %HOME%process\\RI\\Memory.bat", False),
-            ("call %HOME%process\\RI\\HDD_CMD.bat", False),
-            ("call %HOME%process\\RI\\3DMark.bat", False),
-            ("call %HOME%process\\RI\\SetFanSpeed.bat", False),
-            ("call %HOME%process\\RI\\S3sleeptest.bat", True),
-            ("call %HOME%process\\RI\\S4sleeptest.bat", True),
-            ("call %HOME%process\\RI\\CheckDriver.bat", False),
-            ("call %HOME%process\\RI\\BTWIFI.bat", False)
+            ("call .\\RI\\BatteryInfo.bat", False),
+            ("call .\\RI\\Battery.bat", False),
+            ("call .\\RI\\TurnOnOff.bat", False),
+            ("call .\\RI\\RICamera.bat", False),
+            ("call .\\RI\\ColdBoot.bat", True),
+            ("call .\\RI\\RTC.bat", True),
+            ("call.\\RI\\Memory.bat", False),
+            ("call .\\RI\\HDD_CMD.bat", False),
+            ("call .\\RI\\3DMark.bat", False),
+            ("call .\\RI\\SetFanSpeed.bat", False),
+            ("call .\\RI\\S3sleeptest.bat", True),
+            ("call .\\RI\\S4sleeptest.bat", True),
+            ("call .\\RI\\CheckDriver.bat", False),
+            ("call .\\RI\\BTWIFI.bat", False)
         ]
 
         for idx, (cmd, will_interrupt) in enumerate(items):
@@ -143,7 +140,7 @@ class ODM_RunIn_Project(BaseRunInApp):
     # --- Block 3 實作 ---
     def run_block_3(self):
         self.log("--- Block 3: Battery Charge/Discharge ---")
-        self.exec_cmd_wait(r"call %HOME%process\RI\Battery_Cycling_Test.bat")
+        self.exec_cmd_wait(r"call .\RI\Battery_Cycling_Test.bat")
 
 if __name__ == "__main__":
     os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
