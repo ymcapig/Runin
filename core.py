@@ -170,13 +170,43 @@ class BaseRunInApp(QMainWindow):
         self.txt_log.append(f"[{timestamp}] {msg}")
         self.txt_log.ensureCursorVisible()
 
-    def exec_cmd_wait(self, cmd, timeout=None):
+    # 修改 exec_cmd_wait 函式，增加 capture_log 參數
+    def exec_cmd_wait(self, cmd, timeout=None, capture_log=True):
         self.check_stop()
-        self.log(f"CMD > {cmd}")
-        self.current_proc = subprocess.Popen(cmd, shell=True)
         
+        # 根據是否抓 Log 來決定提示訊息
+        if capture_log:
+            self.log(f"CMD > {cmd}")
+            # 使用 PIPE 抓取輸出 (原本的邏輯)
+            self.current_proc = subprocess.Popen(
+                cmd, 
+                shell=True, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.STDOUT
+            )
+        else:
+            self.log(f"CMD > {cmd} (Log Capture Disabled)")
+            # [修正點] 不使用 PIPE，直接繼承 Console，避免 FDPCMD 崩潰
+            self.current_proc = subprocess.Popen(cmd, shell=True)
+
         try:
+            if capture_log:
+                # 有抓 Log 才需要讀取迴圈
+                while True:
+                    output_bytes = self.current_proc.stdout.readline()
+                    if not output_bytes and self.current_proc.poll() is not None:
+                        break
+                    if output_bytes:
+                        try:
+                            line = output_bytes.decode('cp950', errors='replace').strip()
+                            if line:
+                                self.log(f"[SYS] {line}")
+                        except Exception as e:
+                            print(f"Decode error: {e}")
+            
+            # 等待結束
             ret = self.current_proc.wait(timeout=timeout)
+            
         except Exception as e:
             raise e
         finally:
@@ -189,8 +219,8 @@ class BaseRunInApp(QMainWindow):
         
         self.log("CMD < PASS")
 
-    def save_state(self, block, step, cycle=1):
-        state = {"block": block, "step": step, "cycle": cycle}
+    def save_state(self, block, step, cycle=1, status="IDLE"):
+        state = {"block": block, "step": step, "cycle": cycle, "status": status}
         with open(self.state_file, "w") as f: json.dump(state, f)
 
     def load_state(self):
