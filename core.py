@@ -35,7 +35,7 @@ class RunInWorker(QThread):
 class BaseRunInApp(QMainWindow):
     sig_update_ui_log = pyqtSignal(str)
 
-    def __init__(self, title="ODM Run-In Framework (PyQt5)"):
+    def __init__(self, title="ACER Run-In Test"):
         super().__init__()
         self.setWindowTitle(title)
         self.resize(800, 600)
@@ -260,7 +260,7 @@ class BaseRunInApp(QMainWindow):
             self.btn_stop.setEnabled(False)
             self.clear_state()
         else:
-            self.btn_start.setEnabled(True)
+            self.btn_start.setEnabled(False)
             self.btn_start.setText("FINISHED")
             self.btn_stop.setEnabled(False)
             
