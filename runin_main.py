@@ -288,16 +288,17 @@ class ODM_RunIn_Project(BaseRunInApp):
     def ensure_process_killed(self, process_name):
         self.log(f"Stopping {process_name}...")
         subprocess.run(f"taskkill /F /IM {process_name}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
+        time.sleep(1)
         # Retry check
-        for _ in range(5):
+        for _ in range(10):
+            self.log(f"Stopping {process_name} retry...")
             is_running = False
             for proc in psutil.process_iter(['name']):
                 if proc.info['name'] and proc.info['name'].lower() == process_name.lower():
                     is_running = True
                     break
             if not is_running: return
-            time.sleep(1)
+            time.sleep(2)
             subprocess.run(f"taskkill /F /IM {process_name}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # --- Helper: PTAT 檢查 (依 Config 欄位) ---
@@ -352,7 +353,80 @@ class ODM_RunIn_Project(BaseRunInApp):
                 self.log(f"WARNING: Invalid value for [{target_col_name}]")
         
         return errors
+    
+    def analyze_gpumon_log(self, csv_path, col_idx, duration_sec=120):
+        if not os.path.exists(csv_path): return 0.0
+        values = []
+        cutoff_time = datetime.now() - timedelta(seconds=duration_sec)       
+        try:
+            with open(csv_path, 'r', encoding='utf-8', errors='ignore') as f:
+                reader = csv.reader(f)
+                next(reader, None) # Skip Header
+                for row in reader:
+                    # GPUMon CSV: Iteration(0), Date(1), Timestamp(2), Data(3...)
+                    if len(row) <= col_idx or len(row) < 3: continue
+                    try:
+                        date_str = row[1].strip() # 2026/01/11
+                        time_str = row[2].strip() # 22:34:39:692
+                        
+                        # 處理毫秒分隔符號
+                        if time_str.count(':') == 3:
+                            last_colon = time_str.rfind(':')
+                            time_str = time_str[:last_colon] + '.' + time_str[last_colon+1:]
+                        
+                        full_time_str = f"{date_str} {time_str}"
+                        # 格式: YYYY/MM/DD HH:MM:SS.f
+                        t_obj = datetime.strptime(full_time_str, '%Y/%m/%d %H:%M:%S.%f')
+                        
+                        if t_obj >= cutoff_time:
+                            values.append(float(row[col_idx]))
+                    except ValueError: continue
 
+            if not values: return 0.0
+            return sum(values) / len(values)
+        except Exception as e:
+            self.log(f"GPUMon Analysis Error: {e}")
+            return 0.0
+    
+    def check_gpumon_metrics(self, csv_path, test_mode="Test1"):
+        self.log(f"Verifying GPUMon Metrics ({test_mode})...")
+        errors = []       
+        # 1. 找出 Config Keys
+        gpu_keys = []
+        for key, value in self.config['Block1_Thermal'].items():
+            if key.lower().startswith('gpumon_key_'):
+                gpu_keys.append(value)
+        
+        if not gpu_keys: return []
+        # 2. 建立 Header Map
+        header_map = {}
+        with open(csv_path, 'r') as f:
+            reader = csv.reader(f)
+            headers = next(reader, None)
+            if not headers: return ["GPUMon CSV is empty"]
+            header_map = {name.strip(): idx for idx, name in enumerate(headers)}
+        # 3. 檢查數值
+        for target_col in gpu_keys:
+            if target_col not in header_map:
+                errors.append(f"GPUMon Column '{target_col}' not found")
+                continue           
+            avg_val = self.analyze_gpumon_log(csv_path, header_map[target_col], duration_sec=120)
+            
+            try:
+                cfg_low = f"{test_mode}_Low"
+                cfg_high = f"{test_mode}_High"
+                limit_low = float(self.config[target_col][cfg_low])
+                limit_high = float(self.config[target_col][cfg_high])
+                
+                if avg_val < limit_low or avg_val > limit_high:
+                    msg = f"GPUMon {target_col} FAIL: {avg_val:.2f} (Spec: {limit_low}~{limit_high})"
+                    self.log(msg)
+                    errors.append(msg)
+                else:
+                    self.log(f"GPUMon PASS: {target_col} = {avg_val:.2f}")
+            except Exception as e:
+                errors.append(f"GPUMon Config Error [{target_col}]: {e}")               
+        return errors
     # ==========================================
     # Block 1 實作 (Thermal)
     # ==========================================
@@ -400,9 +474,14 @@ class ODM_RunIn_Project(BaseRunInApp):
             duration = int(self.config['Block1_Thermal']['Test1_Duration'])
             fan_log = os.path.join(log_dir, "CPU_Fan.csv")
             fan_thread = None
-
+            gpumon_keys = [k for k in self.config['Block1_Thermal'] if k.lower().startswith('gpumon_key_')]
+            is_gpumon_enabled = len(gpumon_keys) > 0
+            if is_gpumon_enabled:
+                self.log(f"GPUMon Enabled (Found {len(gpumon_keys)} keys).")
+            else:
+                self.log("GPUMon Disabled (No keys found in Config).")
             try:
-                # 1. 啟動 Prime95 (Tool)
+                # 1. 啟動 Prime95 (Tool) & Furmark
                 cmd_furmark = r"start .\RI\FurMark\FurMark_GUI.exe"
                 self.log(f"Starting furmark: {cmd_furmark}")
                 p_stress = subprocess.Popen(cmd_furmark, shell=True)
@@ -440,11 +519,22 @@ class ODM_RunIn_Project(BaseRunInApp):
                 fan_thread = FanMonitorThread(fan_log)
                 fan_thread.start()
 
+                # --- [新增] 啟動 GPUMon ---
+                if is_gpumon_enabled:
+                    gpu_mon_dir = os.path.join(self.base_dir, "RI", "GPUMon")
+                    # 確保資料夾存在，若無則建立(或是依賴已經存在)
+                    if not os.path.exists(gpu_mon_dir): os.makedirs(gpu_mon_dir)
+                    # 指令: -custom:timestamp,temp,pwr,clk -wake -log:cpu_gpumon.csv
+                    gpu_cmd = "GPUMonCmd.exe -custom:timestamp,temp,pwr,clk -wake -log:cpu_gpumon.csv"
+                    self.log(f"Starting GPUMon: {gpu_cmd}")
+                    # 設定 cwd 為 RI\GPUMon，這樣 log 才會產在該資料夾內
+                    p_gpumon = subprocess.Popen(gpu_cmd, cwd=gpu_mon_dir, shell=True)
+
                 # 6. 正式等待測試時間
                 self.log(f"Running Stress for {duration} seconds...")
                 for i in range(duration):
                     if i % 10 == 0: QApplication.processEvents()
-                    self.check_stop() # [安全修正] 檢查 STOP
+                    self.check_stop()
                     time.sleep(1)
 
             except Exception as e:
@@ -459,18 +549,27 @@ class ODM_RunIn_Project(BaseRunInApp):
                 ptat_cmd = "PTAT.exe -stop"
                 self.log(f"Stop PTAT: {ptat_cmd}")
                 p_ptat = subprocess.Popen(ptat_cmd, cwd=ptat_dir, shell=True)
+                try:
+                    p_ptat.wait(timeout=60)
+                except:
+                    pass
+                self.log("Waiting for PTAT to finish writing log...")
                 self.ensure_process_killed("PTAT.exe")
-                
+                self.ensure_process_killed("GPUMonCmd.exe")
+                for i in range(15):
+                    if i % 10 == 0: QApplication.processEvents()
+                    time.sleep(1)
+                time.sleep(1) # 稍等檔案釋放
                 # B. 停 Fan Monitor
                 if fan_thread:
                     fan_thread.stop()
                 #self.ensure_process_killed("FanControl.exe")
                 
                 # C. 殺 Prime95
-                self.ensure_process_killed("prime95.exe")
-                
+                self.ensure_process_killed("prime95.exe")                
                 time.sleep(2) 
-
+                self.ensure_process_killed("FurMark_GUI.exe")  
+                time.sleep(2) 
             # 8. 結果判定 (若前面被 Stop 中斷，這裡不會執行)
             self.log("Verifying Results...")
             all_failures = [] #錯誤收集器
@@ -518,7 +617,30 @@ class ODM_RunIn_Project(BaseRunInApp):
                     all_failures.append(msg)
             else:
                 self.log(f"WARNING: No PTAT Log found in {ptat_log_dir}")
-            
+                all_failures.append("PTAT Log missing")
+            # --- [新增] 3. GPUMon Check ---
+            # 來源檔案: RI\GPUMon\cpu_gpumon.csv
+            src_gpu_log = os.path.join(gpu_mon_dir, "cpu_gpumon.csv")        
+            if os.path.exists(src_gpu_log):
+                # 備份檔案: C:\Diag\Thermal\TIMESTAMP_Test1_GPUMon.csv
+                timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+                dest_gpu_name = f"{timestamp}_Test1_GPUMon.csv"
+                dest_gpu_path = os.path.join(log_dir, dest_gpu_name)              
+                try:
+                    shutil.copy2(src_gpu_log, dest_gpu_path)
+                    self.log(f"GPUMon Log archived: {dest_gpu_name}")                    
+                    # 執行檢查 (Test1)
+                    gpu_errors = self.check_gpumon_metrics(dest_gpu_path, test_mode="Test1")
+                    if gpu_errors:
+                        all_failures.extend(gpu_errors)
+                    else:
+                        self.log("GPUMon Check PASS.")                       
+                except Exception as e:
+                    self.log(f"GPUMon Copy/Check Error: {e}")
+                    all_failures.append(f"GPUMon Error: {e}")
+            else:
+                self.log("WARNING: GPUMon Log not found!")
+                all_failures.append("GPUMon Log missing") # 視需求開啟            
             # ==========================================
             # 最終判定 (若有任何錯誤，才 Raise)
             # ==========================================
