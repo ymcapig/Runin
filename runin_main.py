@@ -394,7 +394,7 @@ class ODM_RunIn_Project(BaseRunInApp):
 
                 # 3. 啟動 PTAT (Monitor)
                 ptat_dir = r"C:\Program Files\Intel Corporation\Intel(R)PTAT"
-                ptat_cmd = "PTAT.exe -start -m=cpu.json"
+                ptat_cmd = "PTAT.exe -start -w=cpu.json"
                 self.log(f"Starting PTAT: {ptat_cmd}")
                 p_ptat = subprocess.Popen(ptat_cmd, cwd=ptat_dir, shell=True)
 
@@ -568,3 +568,4 @@ if __name__ == "__main__":
     win = ODM_RunIn_Project(title="ODM Run-In Framework (PyQt5)")
     win.show()
     sys.exit(app.exec_())
+
