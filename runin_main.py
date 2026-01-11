@@ -2,10 +2,76 @@ import sys
 import os
 import time
 import psutil 
+import csv
+import subprocess
+import threading
+import shutil  # 用於複製檔案
+from datetime import datetime, timedelta
 from PyQt5.QtWidgets import QApplication
 from core import BaseRunInApp
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QThread
 
+# ==========================================
+# Helper: 風扇監控執行緒 (背景執行)
+# ==========================================
+class FanMonitorThread(QThread):
+    def __init__(self, csv_path, interval=5):
+        super().__init__()
+        self.csv_path = csv_path
+        self.interval = interval
+        self.running = True
+
+    def run(self):
+        # 確保目錄存在
+        os.makedirs(os.path.dirname(self.csv_path), exist_ok=True)
+        
+        # 寫入 CSV Header
+        with open(self.csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["Timestamp", "Fan1_RPM", "Fan2_RPM"])
+
+        while self.running:
+            try:
+                now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                rpm1 = self.get_rpm(1)
+                rpm2 = self.get_rpm(2)
+                
+                with open(self.csv_path, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([now, rpm1, rpm2])
+            except Exception as e:
+                pass 
+
+            # 間隔休息
+            for _ in range(self.interval):
+                if not self.running: break
+                self.msleep(1000)
+
+    def get_rpm(self, fan_id):
+        try:
+            # 假設 DiagECtool 在 .\RI 目錄下
+            cmd = f".\\RI\\DiagECtool.exe fan --get-rpm --id {fan_id}"
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            output = subprocess.check_output(cmd, startupinfo=si, shell=True).decode().strip()
+            
+            # 解析 "Fan RPM: 3000" 格式
+            if ":" in output:
+                val_str = output.split(":")[-1].strip()
+                return int(val_str) if val_str.isdigit() else 0
+            
+            # 若直接回傳數字
+            return int(output) if output.isdigit() else 0
+        except:
+            return 0
+
+    def stop(self):
+        self.running = False
+        self.wait()
+
+# ==========================================
+# 主程式邏輯
+# ==========================================
 class ODM_RunIn_Project(BaseRunInApp):
 
     def user_test_sequence(self):
@@ -13,54 +79,57 @@ class ODM_RunIn_Project(BaseRunInApp):
         current_block = "1"
         current_step = 0
         current_cycle = 1
-        # 斷點續傳恢復
+        last_status = "IDLE"
+
+        # 斷點續傳恢復邏輯
         if state:
             current_block = state.get("block", "1")
             current_step = state.get("step", 0)
             current_cycle = state.get("cycle", 1)
-            last_status = state.get("status", "IDLE") # 讀取上次狀態
+            last_status = state.get("status", "IDLE")
 
             self.log(f">>> RESUMING Block {current_block}, Step {current_step} <<<")
 
-            # 如果上次紀錄是 "RUNNING"，代表跑到一半當機或斷電重開
+            # 偵測非預期當機 (上次狀態仍為 RUNNING)
             if last_status == "RUNNING":
                 self.log(f"!!! DETECTED CRASH/HANG AT BLOCK {current_block} STEP {current_step} !!!")
                 self.log("Marking this step as FAIL and skipping...")
                 
-                # 1. 產生 FAIL 檔案
-                self.generate_result_file(False)
-                
-                # 2. 強制跳過這個會當機的步驟，避免無限迴圈
+                # 簡單的 Fail Log
+                with open("RunIn_Crash.log", "a") as f:
+                    f.write(f"Crash at Block {current_block} Step {current_step}\n")
+
+                # 跳過該步驟，避免無限重啟
                 current_step += 1
-                
-                # 3. 更新狀態為 IDLE，讓流程繼續
                 self.save_state(current_block, current_step, current_cycle, status="IDLE")
+
         # ---------------------------------------------------
         # Block 1: Thermal
         # ---------------------------------------------------
         if current_block == "1":
             if self.config['Block1_Thermal'].getboolean('Enabled'):
-                self.run_block_1(start_from_step=current_step)
-                # 跑完後切換到 Block 2
+                self.run_block_1(start_from_step=current_step, current_cycle=current_cycle)
                 current_block = "2"
                 current_step = 0
-                self.save_state("2", 0, current_cycle)
+                self.save_state("2", 0, current_cycle, status="IDLE")
             else:
                 self.log("Block 1 is Disabled. Skipping to Block 2...")
-                current_block = "2" # 即使不跑，也要切換狀態
+                current_block = "2"
+                self.save_state("2", 0, current_cycle, status="IDLE")
 
         # ---------------------------------------------------
         # Block 2: Aging
         # ---------------------------------------------------
         if current_block == "2":
             if self.config['Block2_Aging'].getboolean('Enabled'):
-                self.run_block_2(start_from_step=current_step)
+                self.run_block_2(start_from_step=current_step, current_cycle=current_cycle)
                 current_block = "3"
                 current_step = 0
-                self.save_state("3", 0, current_cycle)
+                self.save_state("3", 0, current_cycle, status="IDLE")
             else:
                 self.log("Block 2 is Disabled. Skipping to Block 3...")
                 current_block = "3"
+                self.save_state("3", 0, current_cycle, status="IDLE")
 
         # ---------------------------------------------------
         # Block 3: Battery
@@ -71,112 +140,385 @@ class ODM_RunIn_Project(BaseRunInApp):
             else:
                 self.log("Block 3 is Disabled. Skipping...")
             
-            # 全部跑完 (或全部跳過)
             self.clear_state()
             self.log("=== ALL BLOCKS FINISHED ===")
+
+    # --- Helper: 計算 CSV 平均值 ---
+    def analyze_fan_log_average(self, csv_path, col_idx, duration_sec=120):
+        self.log(f"Analyzing {os.path.basename(csv_path)}...")
+        if not os.path.exists(csv_path):
+            self.log("Error: Log file not found.")
+            return 0.0
+            
+        values = []
+        cutoff_time = datetime.now() - timedelta(seconds=duration_sec)
         
-# --- Block 1 實作 ---
-    def run_block_1(self, start_from_step=0):
+        try:
+            with open(csv_path, 'r') as f:
+                reader = csv.reader(f)
+                next(reader, None) # Skip Header
+                for row in reader:
+                    if len(row) <= col_idx: continue
+                    try:
+                        t_str = row[0]
+                        # 假設 CSV 時間格式 YYYY-mm-dd HH:MM:SS
+                        t_obj = datetime.strptime(t_str, '%Y-%m-%d %H:%M:%S')
+                        if t_obj >= cutoff_time:
+                            values.append(float(row[col_idx]))
+                    except: continue
+            
+            if not values: 
+                self.log("Warning: No valid data found in timeframe.")
+                return 0.0
+            
+            avg = sum(values) / len(values)
+            self.log(f"Average: {avg:.2f}")
+            return avg
+        except Exception as e:
+            self.log(f"Analysis Error: {e}")
+            return 0.0
+    def analyze_ptat_log(self, csv_path, col_idx, duration_sec=120):
+            """ 
+            讀取 PTAT CSV: 
+            - Date 在第 1 欄 (MM/DD/YYYY)
+            - Time 在第 2 欄 (HH:MM:SS:fff) (毫秒用冒號分隔)
+            """
+            self.log(f"[PTAT Analysis] {os.path.basename(csv_path)}")
+            if not os.path.exists(csv_path):
+                self.log("Error: Log file not found.")
+                return 0.0
+                
+            values = []
+            cutoff_time = datetime.now() - timedelta(seconds=duration_sec)
+            
+            try:
+                with open(csv_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    reader = csv.reader(f)
+                    next(reader, None) # Skip Header
+                    
+                    for row in reader:
+                        # PTAT 至少要有 3 欄 (Version, Date, Time) + 數據
+                        if len(row) <= col_idx or len(row) < 3: continue
+                        
+                        try:
+                            date_str = row[1] # e.g. 10/01/2026
+                            time_str = row[2] # e.g. 08:53:58:985
+                            
+                            # 修正 PTAT 的毫秒格式: 08:53:58:985 -> 08:53:58.985
+                            if time_str.count(':') == 3:
+                                last_colon = time_str.rfind(':')
+                                time_str = time_str[:last_colon] + '.' + time_str[last_colon+1:]
+                            
+                            full_time_str = f"{date_str} {time_str}"
+                            # 解析合併後的時間
+                            t_obj = datetime.strptime(full_time_str, '%m/%d/%Y %H:%M:%S.%f')
+                            
+                            if t_obj >= cutoff_time:
+                                values.append(float(row[col_idx]))
+                        except ValueError:
+                            continue
+                
+                if not values: 
+                    self.log("Warning: No valid PTAT data found in timeframe.")
+                    return 9999.0
+                
+                avg = sum(values) / len(values)
+                return avg  # 這裡不印 log 避免洗版，由上層呼叫者印
+                
+            except Exception as e:
+                self.log(f"PTAT Analysis Error: {e}")
+                return 9999.0
+    # --- Helper: 尋找最新 Log ---
+    def find_latest_log(self, folder, prefix="PTATMonitor", extension=".csv"):
+        try:
+            if not os.path.exists(folder): return None
+            files = [os.path.join(folder, f) for f in os.listdir(folder) 
+                     if f.startswith(prefix) and f.endswith(extension)]
+            if not files: return None
+            return max(files, key=os.path.getmtime)
+        except Exception as e:
+            self.log(f"Error finding log: {e}")
+            return None
+
+    # --- Helper: 確保 Process 關閉 ---
+    def ensure_process_killed(self, process_name):
+        self.log(f"Stopping {process_name}...")
+        subprocess.run(f"taskkill /F /IM {process_name}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        # Retry check
+        for _ in range(5):
+            is_running = False
+            for proc in psutil.process_iter(['name']):
+                if proc.info['name'] and proc.info['name'].lower() == process_name.lower():
+                    is_running = True
+                    break
+            if not is_running: return
+            time.sleep(1)
+            subprocess.run(f"taskkill /F /IM {process_name}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # --- Helper: PTAT 檢查 (依 Config 欄位) ---
+    def check_ptat_metrics(self, csv_path):
+        self.log(f"Verifying PTAT Metrics in {os.path.basename(csv_path)}...")
+        if not os.path.exists(csv_path): raise Exception("PTAT Log not found")
+
+        # 1. 找出 Config 定義的 Keys
+        ptat_keys = []
+        for key, value in self.config['Block1_Thermal'].items():
+            if key.lower().startswith('ptat_key_'):
+                ptat_keys.append(value)
+        
+        if not ptat_keys:
+            self.log("No PTAT_Key defined in Config. Skipping check.")
+            return
+
+        # 2. 建立 Header Map
+        header_map = {}
+        with open(csv_path, 'r') as f:
+            reader = csv.reader(f)
+            headers = next(reader, None)
+            if not headers: raise Exception("PTAT CSV is empty")
+            header_map = {name.strip(): idx for idx, name in enumerate(headers)}
+
+        # 3. 檢查每個 Key
+        for target_col_name in ptat_keys:
+            if target_col_name not in header_map:
+                self.log(f"WARNING: Column '{target_col_name}' not found! Skipping.")
+                continue
+                
+            col_idx = header_map[target_col_name]
+            avg_val = self.analyze_ptat_log(csv_path, col_idx, duration_sec=120)
+            
+            try:
+                # 讀取該 Key 對應的 Section [ColumnName]
+                limit_low = float(self.config[target_col_name]['Low'])
+                limit_high = float(self.config[target_col_name]['High'])
+                
+                self.log(f"Checking '{target_col_name}': Avg={avg_val:.2f} (Spec: {limit_low}~{limit_high})")
+                
+                if avg_val < limit_low or avg_val > limit_high:
+                    raise Exception(f"PTAT FAIL: {target_col_name} ({avg_val:.2f}) out of range!")
+            except KeyError:
+                self.log(f"WARNING: No config section found for [{target_col_name}]")
+            except ValueError:
+                self.log(f"WARNING: Invalid Low/High value for [{target_col_name}]")
+
+    # ==========================================
+    # Block 1 實作 (Thermal)
+    # ==========================================
+    def run_block_1(self, start_from_step=0, current_cycle=1):
         self.log("--- Block 1: Thermal Tool ---")
+        log_dir = r"C:\Diag\Thermal"
+        os.makedirs(log_dir, exist_ok=True)
         
-        # Step 0: 電量檢查 (每分鐘檢查一次，直到達標)
+        # Step 0: 電量檢查
         if start_from_step == 0:
             threshold = int(self.config['Block1_Thermal']['Start_Battery_Threshold'])
             self.log(f"Step 0: Waiting for Battery > {threshold}%...")
             
             while True:
+                # [安全修正] 檢查停止訊號
                 self.check_stop()
+                QApplication.processEvents() 
                 try:
                     bat = psutil.sensors_battery()
                     if bat:
                         current_pct = bat.percent
                         is_plugged = bat.power_plugged
                         status_str = "Charging" if is_plugged else "Discharging"
-                        
                         self.log(f"Battery Status: {current_pct}% ({status_str}) / Target: {threshold}%")
 
                         if current_pct >= threshold:
-                            self.log("Battery Threshold Reached! Starting tests...")
+                            self.log("Battery Threshold Reached!")
                             break
-                        
                         if not is_plugged:
                             self.log("WARNING: AC Adapter not plugged in!")
                     else:
-                        self.log("No battery detected (Desktop?). Skipping check.")
+                        self.log("No battery detected. Skipping check.")
                         break
-
                 except Exception as e:
                     self.log(f"Error reading battery: {e}")
-
-                # 等待 60 秒 (1分鐘) 再檢查
-                self.check_stop()
                 time.sleep(5)
             
-        # Step 1: 單燒
-        if start_from_step <= 1:
-            self.log("[Test 1] Single Stress")
-            self.exec_cmd_wait(r"call .\RI\Thermal_Single.bat")
-            self.save_state("1", 2)
+            self.save_state("1", 1, current_cycle, status="IDLE")
 
-        # Step 2: Fan
+        # ==========================================
+        # [Test 1] Single Stress (參照 Prime95.bat 流程)
+        # ==========================================
+        if start_from_step <= 1:
+            self.log("[Test 1] Single Stress Start")
+            duration = int(self.config['Block1_Thermal']['Test1_Duration'])
+            fan_log = os.path.join(log_dir, "Test1_Fan.csv")
+            fan_thread = None
+
+            # [安全修正] 使用 try...finally 確保工具一定會被關閉
+            try:
+                # 1. 啟動 Prime95 (Tool)
+                cmd_stress = r".\RI\prime95\prime95.exe -t -small -A16"
+                self.log(f"Starting Prime95: {cmd_stress}")
+                p_stress = subprocess.Popen(cmd_stress, shell=True)
+
+                # 2. 等待 40 秒
+                self.log("Waiting 40s before starting PTAT...")
+                for _ in range(40):
+                    self.check_stop() # [安全修正] 檢查 STOP
+                    QApplication.processEvents()
+                    time.sleep(1)
+
+                # 3. 啟動 PTAT (Monitor)
+                ptat_dir = r"C:\Program Files\Intel Corporation\Intel(R)PTAT"
+                ptat_cmd = "PTAT.exe -start -m=cpu.json"
+                self.log(f"Starting PTAT: {ptat_cmd}")
+                p_ptat = subprocess.Popen(ptat_cmd, cwd=ptat_dir, shell=True)
+
+                # 4. 等待 20 秒
+                self.log("Waiting 20s before starting Fan Monitor...")
+                for _ in range(20):
+                    self.check_stop() # [安全修正] 檢查 STOP
+                    QApplication.processEvents()
+                    time.sleep(1)
+
+                # 5. 啟動 Fan Monitor
+                fan_thread = FanMonitorThread(fan_log)
+                fan_thread.start()
+
+                # 6. 正式等待測試時間
+                self.log(f"Running Stress for {duration} seconds...")
+                for i in range(duration):
+                    if i % 10 == 0: QApplication.processEvents()
+                    self.check_stop() # [安全修正] 檢查 STOP
+                    time.sleep(1)
+
+            except Exception as e:
+                self.log(f"Test 1 Interrupted or Error: {e}")
+                raise e # 往上拋，讓主流程處理停止
+
+            finally:
+                # [安全修正] Teardown: 確保工具被殺掉 (無論是按 Stop 還是正常結束)
+                self.log("Stopping Tools (Teardown)...")                
+                # A. 殺 PTAT
+                ptat_dir = r"C:\Program Files\Intel Corporation\Intel(R)PTAT"
+                ptat_cmd = "PTAT.exe -stop"
+                self.log(f"Stop PTAT: {ptat_cmd}")
+                p_ptat = subprocess.Popen(ptat_cmd, cwd=ptat_dir, shell=True)
+                self.ensure_process_killed("PTAT.exe")
+                
+                # B. 停 Fan Monitor
+                if fan_thread:
+                    fan_thread.stop()
+                #self.ensure_process_killed("FanControl.exe")
+                
+                # C. 殺 Prime95
+                self.ensure_process_killed("prime95.exe")
+                
+                time.sleep(2) 
+
+            # 8. 結果判定 (若前面被 Stop 中斷，這裡不會執行)
+            self.log("Verifying Results...")
+            
+            # (A) Fan Check
+            fan_min = int(self.config['Block1_Thermal']['Fan_Min_RPM'])
+            avg_fan1 = self.analyze_fan_log_average(fan_log, 1) 
+            avg_fan2 = self.analyze_fan_log_average(fan_log, 2) 
+            
+            if avg_fan1 < fan_min or avg_fan2 < fan_min:
+                raise Exception(f"Test 1 FAIL: Fan RPM Low ({avg_fan1}, {avg_fan2})")
+
+            # (B) PTAT Check
+            user_home = os.path.expanduser("~")
+            ptat_log_dir = os.path.join(user_home, "Documents", "iPTAT", "log")
+            
+            ptat_log = self.find_latest_log(ptat_log_dir, prefix="PTATMonitor")
+            if ptat_log:
+                timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+                new_filename = f"{timestamp}_CPU_PTAT.csv"
+                dest_path = os.path.join(log_dir, new_filename)
+                
+                try:
+                    self.log(f"Copying PTAT Log to {dest_path}...")
+                    shutil.copy2(ptat_log, dest_path)
+                    
+                    # 使用複製後的檔案進行檢查
+                    self.check_ptat_metrics(dest_path)
+                    self.log("PTAT Check PASS.")
+                except Exception as e:
+                    self.log(f"Error handling PTAT Log: {e}")
+                    raise Exception("PTAT Log Error")
+            else:
+                self.log(f"WARNING: No PTAT Log found in {ptat_log_dir}")
+
+            self.log("Test 1 PASS.")
+
+            # 9. Reboot Check
+            self.save_state("1", 2, current_cycle, status="IDLE")
+            if self.config['Block1_Thermal'].getboolean('Test1_Reboot'):
+                self.log("Rebooting as per config...")
+                self.trigger_reboot()
+            else:
+                self.log("Continuing to next step...")
+
+        # Step 2: Fan Max Speed
         if start_from_step <= 2:
             self.log("[Test 2] Fan Max Speed")
             self.exec_cmd_wait(r"call .\RI\Thermal_Fan.bat")
-            self.log("Rebooting for Test 3...")
-            self.save_state("1", 3)
-            self.trigger_reboot()
+            
+            self.save_state("1", 3, current_cycle, status="IDLE")
+            if self.config['Block1_Thermal'].getboolean('Test2_Reboot'):
+                self.log("Rebooting for Test 3...")
+                self.trigger_reboot()
 
-        # Step 3: 雙燒
+        # Step 3: Dual Stress
         if start_from_step <= 3:
             self.log("[Test 3] Dual Stress")
             self.exec_cmd_wait(r"call .\RI\Thermal_Dual.bat")
-            self.log("Block 1 PASS. Rebooting to Block 2...")
-            self.save_state("2", 0)
-            self.trigger_reboot()
+            self.log("Block 1 PASS. Moving to Block 2...")
+            
+            if self.config['Block1_Thermal'].getboolean('Test3_Reboot'):
+                 self.log("Rebooting before Block 2...")
+                 self.save_state("2", 0, current_cycle, status="IDLE")
+                 self.trigger_reboot()
 
-    # --- Block 2 實作 ---
-    def run_block_2(self, start_from_step=0):
+    # ==========================================
+    # Block 2 實作 (Aging)
+    # ==========================================
+    def run_block_2(self, start_from_step=0, current_cycle=1):
         self.log("--- Block 2: Aging Test ---")
-        items = [("cd .\\RI && call .\\BatteryInfo.bat", False, False),
-                ("cd .\\RI && call .\\Battery.bat", False, True),
-                ("cd .\\RI && call .\\TurnOnOff.bat", False, True),
-                ("cd .\\RI && call .\\RICamera.bat", False, True),
-                #("cd .\\RI && call .\\ColdBoot.bat", True, True),
-                ("cd .\\RI && call .\\RTC.bat", False, True),
-                ("cd .\\RI && call .\\Memory.bat", False, True),
-                ("cd .\\RI && call .\\HDD_CMD.bat", False, True),
-                ("cd .\\RI && call .\\3DMark.bat", False, True),
-                ("cd .\\RI && call .\\SetFanSpeed.bat", False, True),
-                ("cd .\\RI && call .\\S3sleeptest.bat", True, True),
-                ("cd .\\RI && call .\\S4sleeptest.bat", True, True),
-                ("cd .\\RI && call .\\CheckDriver.bat", False, True),
-                ("cd .\\RI && call .\\BTWIFI.bat", False, True)]
-        # 這裡解包原本是 (cmd, will_interrupt)，現在變成 (cmd, will_interrupt, capture_log)
+        items = [(r"call .\RI\BatteryInfo.bat", False, False),
+                 (r"call .\RI\Battery.bat", False, True),
+                 (r"call .\RI\TurnOnOff.bat", False, True),
+                 (r"call .\RI\RICamera.bat", False, True),
+                 # (r"call .\RI\ColdBoot.bat", True, True),
+                 (r"call .\RI\RTC.bat", False, True),
+                 (r"call .\RI\Memory.bat", False, True),
+                 (r"call .\RI\HDD_CMD.bat", False, True),
+                 (r"call .\RI\3DMark.bat", False, True),
+                 (r"call .\RI\SetFanSpeed.bat", False, True),
+                 (r"call .\RI\S3sleeptest.bat", True, True),
+                 (r"call .\RI\S4sleeptest.bat", True, True),
+                 (r"call .\RI\CheckDriver.bat", False, True),
+                 (r"call .\RI\BTWIFI.bat", False, True)]
+        
         for idx, (cmd, will_interrupt, capture_log) in enumerate(items):
             if idx < start_from_step: continue
-            # [特例處理] S3 或 S4 測試
+            
+            # S3/S4 特殊處理 (Save RUNNING)
             if "sleeptest" in cmd: 
-                # 1. 執行前：標記狀態為 RUNNING (正在跑)
-                #    如果不幸睡死重開，下次啟動就會抓到這個標記
-                self.save_state("2", idx, status="RUNNING")
-                # 2. 執行測試
+                self.save_state("2", idx, current_cycle, status="RUNNING")
                 self.exec_cmd_wait(cmd, capture_log=capture_log)
-                # 3. 執行後 (成功醒來)：標記為 IDLE 並推進到下一步
-                self.save_state("2", idx + 1, status="IDLE")
+                self.save_state("2", idx + 1, current_cycle, status="IDLE")
                 continue
 
-            # 一般的 ColdBoot / RTC 重開機測試
-            # 這些測試本來就預期會重開，所以維持「先存下一步」的邏輯
+            # 一般重開機測試
             if will_interrupt:
-                self.save_state("2", idx + 1, status="IDLE")
+                self.save_state("2", idx + 1, current_cycle, status="IDLE")
                 self.exec_cmd_wait(cmd, capture_log=capture_log)
                 if "Boot" in cmd or "RTC" in cmd: return 
             else:
-                # 一般測試
                 self.exec_cmd_wait(cmd, capture_log=capture_log)
-                self.save_state("2", idx + 1, status="IDLE")
+                self.save_state("2", idx + 1, current_cycle, status="IDLE")
 
-    # --- Block 3 實作 ---
+    # ==========================================
+    # Block 3 實作 (Battery)
+    # ==========================================
     def run_block_3(self):
         self.log("--- Block 3: Battery Charge/Discharge ---")
         self.exec_cmd_wait(r"call .\RI\BatteryControl.bat")
@@ -189,5 +531,4 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     win = ODM_RunIn_Project(title="ODM Run-In Framework (PyQt5)")
     win.show()
-    # PyQt5 建議使用 exec_() (雖然新版 Python 支援 exec，但舊版 PyQt5 需加底線)
     sys.exit(app.exec_())
