@@ -7,9 +7,9 @@ import subprocess
 import threading
 import shutil  # 用於複製檔案
 from datetime import datetime, timedelta
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QMessageBox
 from core import BaseRunInApp
-from PyQt5.QtCore import Qt, QThread
+from PyQt5.QtCore import Qt, QThread, QLockFile, QDir, QTimer
 
 # ==========================================
 # Helper: 風扇監控執行緒 (背景執行)
@@ -73,6 +73,27 @@ class FanMonitorThread(QThread):
 # 主程式邏輯
 # ==========================================
 class ODM_RunIn_Project(BaseRunInApp):
+
+    def __init__(self, title="ODM Run-In"):
+        super().__init__(title=title)   
+        # 設定一個 Timer，在介面顯示後 1 秒檢查是否要 Auto Run
+        # 這樣可以確保 UI 已經完全 Load 好
+        QTimer.singleShot(1000, self.check_auto_run)
+
+    # Auto Run 檢查邏輯
+    def check_auto_run(self):
+        try:
+            # 讀取 Config [Global] AutoRun
+            # 注意: 需確保 config.ini 有 [Global] Section
+            if 'Global' in self.config and self.config['Global'].getboolean('AutoRun'):
+                self.log("[AutoRun] Config detected. Starting test automatically...")              
+                # 假設 BaseRunInApp 有一個 self.btn_start 按鈕
+                if hasattr(self, 'btn_start'):
+                    self.btn_start.click()
+                else:
+                    self.log("Error: Start button not found, cannot auto run.")
+        except Exception as e:
+            self.log(f"AutoRun Error: {e}")
 
     def user_test_sequence(self):
         state = self.load_state()
@@ -142,6 +163,13 @@ class ODM_RunIn_Project(BaseRunInApp):
             
             self.clear_state()
             self.log("=== ALL BLOCKS FINISHED ===")
+            # [新增] Auto Close 檢查邏輯
+            if 'Global' in self.config and self.config['Global'].getboolean('AutoClose'):
+                self.log("[AutoClose] Closing application in 3 seconds...")
+                # 為了讓使用者看到 PASS，延遲 3 秒再關閉
+                import time
+                time.sleep(3)
+                QApplication.quit()
 
     # --- Helper: 計算 CSV 平均值 ---
     def analyze_fan_log_average(self, csv_path, col_idx, duration_sec=120):
@@ -529,6 +557,14 @@ if __name__ == "__main__":
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
     app = QApplication(sys.argv)
+    lock_file_path = os.path.join(QDir.tempPath(), 'odm_runin_instance.lock')
+    lock_file = QLockFile(lock_file_path)
+    # 嘗試鎖定，Timeout 設定 100ms
+    if not lock_file.tryLock(100):
+        # 如果鎖定失敗，代表已經有一個實例在執行
+        QMessageBox.critical(None, "Error", "Run-In program is already running!\n(Please close the existing window first)")
+        sys.exit(1)
+
     win = ODM_RunIn_Project(title="ODM Run-In Framework (PyQt5)")
     win.show()
     sys.exit(app.exec_())
