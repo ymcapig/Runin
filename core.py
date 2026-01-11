@@ -38,7 +38,7 @@ class BaseRunInApp(QMainWindow):
     def __init__(self, title="ODM Run-In Framework (PyQt5)"):
         super().__init__()
         self.setWindowTitle(title)
-        self.resize(600, 500)
+        self.resize(800, 600)
         
         # --- 變數初始化 ---
         self.current_proc = None 
@@ -258,6 +258,7 @@ class BaseRunInApp(QMainWindow):
             self.btn_start.setText("STOPPED")
             self.btn_start.setEnabled(False)
             self.btn_stop.setEnabled(False)
+            self.clear_state()
         else:
             self.btn_start.setEnabled(True)
             self.btn_start.setText("FINISHED")
