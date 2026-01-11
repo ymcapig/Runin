@@ -205,6 +205,22 @@ class ODM_RunIn_Project(BaseRunInApp):
         except Exception as e:
             self.log(f"Analysis Error: {e}")
             return 0.0
+        
+    def archive_fan_log(self, src_path, prefix_name):
+        if not os.path.exists(src_path):
+            return
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            new_filename = f"{timestamp}_{prefix_name}.csv"
+            # 假設 log_dir 在 run_block_1 已經定義，或直接存到 src_path 同目錄
+            dest_dir = os.path.dirname(src_path)
+            dest_path = os.path.join(dest_dir, new_filename)
+            
+            shutil.copy2(src_path, dest_path)
+            self.log(f"Fan Log archived: {new_filename}")
+        except Exception as e:
+            self.log(f"Error archiving fan log: {e}")
+
     def analyze_ptat_log(self, csv_path, col_idx, duration_sec=120):
             """ 
             讀取 PTAT CSV: 
@@ -285,9 +301,10 @@ class ODM_RunIn_Project(BaseRunInApp):
             subprocess.run(f"taskkill /F /IM {process_name}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # --- Helper: PTAT 檢查 (依 Config 欄位) ---
-    def check_ptat_metrics(self, csv_path):
+    def check_ptat_metrics(self, csv_path, test_mode="Test1"):
         self.log(f"Verifying PTAT Metrics in {os.path.basename(csv_path)}...")
-        if not os.path.exists(csv_path): raise Exception("PTAT Log not found")
+        errors = []
+        if not os.path.exists(csv_path): return ["PTAT Log not found"]
 
         # 1. 找出 Config 定義的 Keys
         ptat_keys = []
@@ -304,7 +321,7 @@ class ODM_RunIn_Project(BaseRunInApp):
         with open(csv_path, 'r') as f:
             reader = csv.reader(f)
             headers = next(reader, None)
-            if not headers: raise Exception("PTAT CSV is empty")
+            if not headers: return ["PTAT CSV is empty"]
             header_map = {name.strip(): idx for idx, name in enumerate(headers)}
 
         # 3. 檢查每個 Key
@@ -317,18 +334,24 @@ class ODM_RunIn_Project(BaseRunInApp):
             avg_val = self.analyze_ptat_log(csv_path, col_idx, duration_sec=120)
             
             try:
-                # 讀取該 Key 對應的 Section [ColumnName]
-                limit_low = float(self.config[target_col_name]['Low'])
-                limit_high = float(self.config[target_col_name]['High'])
+                cfg_low_key = f"{test_mode}_Low"
+                cfg_high_key = f"{test_mode}_High"
                 
-                self.log(f"Checking '{target_col_name}': Avg={avg_val:.2f} (Spec: {limit_low}~{limit_high})")
-                
+                limit_low = float(self.config[target_col_name][cfg_low_key])
+                limit_high = float(self.config[target_col_name][cfg_high_key])
                 if avg_val < limit_low or avg_val > limit_high:
-                    raise Exception(f"PTAT FAIL: {target_col_name} ({avg_val:.2f}) out of range!")
+                    msg = f"{target_col_name} FAIL: {avg_val:.2f} (Spec: {limit_low}~{limit_high})"
+                    self.log(msg)
+                    errors.append(msg)
+                else:
+                    self.log(f"PASS: {target_col_name} = {avg_val:.2f} (Spec: {limit_low}~{limit_high})")
+
             except KeyError:
-                self.log(f"WARNING: No config section found for [{target_col_name}]")
+                self.log(f"WARNING: Config key '{cfg_low_key}/{cfg_high_key}' missing for [{target_col_name}]")
             except ValueError:
-                self.log(f"WARNING: Invalid Low/High value for [{target_col_name}]")
+                self.log(f"WARNING: Invalid value for [{target_col_name}]")
+        
+        return errors
 
     # ==========================================
     # Block 1 實作 (Thermal)
@@ -370,21 +393,29 @@ class ODM_RunIn_Project(BaseRunInApp):
             self.save_state("1", 1, current_cycle, status="IDLE")
 
         # ==========================================
-        # [Test 1] Single Stress (參照 Prime95.bat 流程)
+        # [Test 1] Single Stress
         # ==========================================
         if start_from_step <= 1:
             self.log("[Test 1] Single Stress Start")
             duration = int(self.config['Block1_Thermal']['Test1_Duration'])
-            fan_log = os.path.join(log_dir, "Test1_Fan.csv")
+            fan_log = os.path.join(log_dir, "CPU_Fan.csv")
             fan_thread = None
 
-            # [安全修正] 使用 try...finally 確保工具一定會被關閉
             try:
                 # 1. 啟動 Prime95 (Tool)
+                cmd_furmark = r"start .\RI\FurMark\FurMark_GUI.exe"
+                self.log(f"Starting furmark: {cmd_furmark}")
+                p_stress = subprocess.Popen(cmd_furmark, shell=True)
+
+                for _ in range(10):
+                    self.check_stop() # [安全修正] 檢查 STOP
+                    QApplication.processEvents()
+                    time.sleep(1)
+
                 cmd_stress = r".\RI\prime95\prime95.exe -t -small -A16"
                 self.log(f"Starting Prime95: {cmd_stress}")
                 p_stress = subprocess.Popen(cmd_stress, shell=True)
-
+                
                 # 2. 等待 40 秒
                 self.log("Waiting 40s before starting PTAT...")
                 for _ in range(40):
@@ -421,7 +452,7 @@ class ODM_RunIn_Project(BaseRunInApp):
                 raise e # 往上拋，讓主流程處理停止
 
             finally:
-                # [安全修正] Teardown: 確保工具被殺掉 (無論是按 Stop 還是正常結束)
+                # Teardown: 確保工具被殺掉 (無論是按 Stop 還是正常結束)
                 self.log("Stopping Tools (Teardown)...")                
                 # A. 殺 PTAT
                 ptat_dir = r"C:\Program Files\Intel Corporation\Intel(R)PTAT"
@@ -442,19 +473,29 @@ class ODM_RunIn_Project(BaseRunInApp):
 
             # 8. 結果判定 (若前面被 Stop 中斷，這裡不會執行)
             self.log("Verifying Results...")
-            
+            all_failures = [] #錯誤收集器
+            self.archive_fan_log(fan_log, "CPU_Fan")
             # (A) Fan Check
-            fan_min = int(self.config['Block1_Thermal']['Fan_Min_RPM'])
-            avg_fan1 = self.analyze_fan_log_average(fan_log, 1) 
-            avg_fan2 = self.analyze_fan_log_average(fan_log, 2) 
-            
-            if avg_fan1 < fan_min or avg_fan2 < fan_min:
-                raise Exception(f"Test 1 FAIL: Fan RPM Low ({avg_fan1}, {avg_fan2})")
-
+            # 讀取 Config
+            try:
+                spec_min = int(self.config['Block1_Thermal']['Test1_Fan_Min'])
+                spec_max = int(self.config['Block1_Thermal']['Test1_Fan_Max'])
+                self.log(f"CPU only fan spec_min:{spec_min}, CPU only fan spec_max:{spec_max}")
+                avg_fan1 = self.analyze_fan_log_average(fan_log, 1) 
+                avg_fan2 = self.analyze_fan_log_average(fan_log, 2) 
+                if not (spec_min <= avg_fan1 <= spec_max) or not (spec_min <= avg_fan2 <= spec_max):
+                    msg = f"Fan RPM FAIL: Fan1={avg_fan1}, Fan2={avg_fan2} (Spec: {spec_min}-{spec_max})"
+                    self.log(msg)
+                    all_failures.append(msg)
+                else:
+                    self.log(f"Fan RPM PASS: {avg_fan1}, {avg_fan2}")           
+            except Exception as e:
+                msg = f"Fan Check Error: {e}"
+                self.log(msg)
+                all_failures.append(msg)
             # (B) PTAT Check
             user_home = os.path.expanduser("~")
-            ptat_log_dir = os.path.join(user_home, "Documents", "iPTAT", "log")
-            
+            ptat_log_dir = os.path.join(user_home, "Documents", "iPTAT", "log")           
             ptat_log = self.find_latest_log(ptat_log_dir, prefix="PTATMonitor")
             if ptat_log:
                 timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -466,16 +507,27 @@ class ODM_RunIn_Project(BaseRunInApp):
                     shutil.copy2(ptat_log, dest_path)
                     
                     # 使用複製後的檔案進行檢查
-                    self.check_ptat_metrics(dest_path)
-                    self.log("PTAT Check PASS.")
+                    ptat_errors = self.check_ptat_metrics(dest_path, test_mode="Test1") 
+                    if ptat_errors:
+                        all_failures.extend(ptat_errors) # 將 PTAT 錯誤加入總名單
+                    else:
+                        self.log("PTAT Check PASS (All items).")
                 except Exception as e:
-                    self.log(f"Error handling PTAT Log: {e}")
-                    raise Exception("PTAT Log Error")
+                    msg = f"PTAT File Process Error: {e}"
+                    self.log(msg)
+                    all_failures.append(msg)
             else:
                 self.log(f"WARNING: No PTAT Log found in {ptat_log_dir}")
-
+            
+            # ==========================================
+            # 最終判定 (若有任何錯誤，才 Raise)
+            # ==========================================
+            if all_failures:
+                # 將所有錯誤組合成一個字串拋出
+                error_summary = " | ".join(all_failures)
+                raise Exception(f"Test 1 FAILED: {error_summary}")
+            
             self.log("Test 1 PASS.")
-
             # 9. Reboot Check
             self.save_state("1", 2, current_cycle, status="IDLE")
             if self.config['Block1_Thermal'].getboolean('Test1_Reboot'):
@@ -565,7 +617,6 @@ if __name__ == "__main__":
         QMessageBox.critical(None, "Error", "Run-In program is already running!\n(Please close the existing window first)")
         sys.exit(1)
 
-    win = ODM_RunIn_Project(title="ODM Run-In Framework (PyQt5)")
+    win = ODM_RunIn_Project(title="ACER Run-In Test")
     win.show()
     sys.exit(app.exec_())
-
