@@ -160,16 +160,31 @@ class ODM_RunIn_Project(BaseRunInApp):
                 self.run_block_3()
             else:
                 self.log("Block 3 is Disabled. Skipping...")
+
+            try:
+                total_cycles = int(self.config['Global']['Total_RunIn_Cycles'])
+            except:
+                total_cycles = 1 # 預設值
+            
+            if current_cycle < total_cycles:
+                next_cycle = current_cycle + 1
+                self.log(f"=== Cycle {current_cycle} Finished. Starting Cycle {next_cycle}/{total_cycles} ===")                
+                # 設定狀態回到 Block 1, Step 0，並更新 Cycle數
+                self.save_state("1", 0, next_cycle, status="IDLE")
+                # 為了確保測試環境乾淨，通常建議重開機進入下一輪
+                # self.log("Rebooting system for the next cycle...")
+                # self.trigger_reboot()
+                return # 結束本次執行，等待重開機
             
             self.clear_state()
             self.log("=== ALL BLOCKS FINISHED ===")
-            # [新增] Auto Close 檢查邏輯
-            if 'Global' in self.config and self.config['Global'].getboolean('AutoClose'):
-                self.log("[AutoClose] Closing application in 3 seconds...")
-                # 為了讓使用者看到 PASS，延遲 3 秒再關閉
-                import time
-                time.sleep(3)
-                QApplication.quit()
+        
+            # if 'Global' in self.config and self.config['Global'].getboolean('AutoClose'):
+            #     self.log("[AutoClose] Closing application in 3 seconds...")
+            #     # 為了讓使用者看到 PASS，延遲 3 秒再關閉
+            #     import time
+            #     time.sleep(3)
+            #     QApplication.quit()
 
     # --- Helper: 計算 CSV 平均值 ---
     def analyze_fan_log_average(self, csv_path, col_idx, duration_sec=120):
@@ -427,6 +442,309 @@ class ODM_RunIn_Project(BaseRunInApp):
             except Exception as e:
                 errors.append(f"GPUMon Config Error [{target_col}]: {e}")               
         return errors
+    
+    def run_fan_curve_test(self):
+            self.log("[Fan Curve Test] Starting...")
+            
+            log_dir = r"C:\Diag\Thermal"
+            os.makedirs(log_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            log_file = os.path.join(log_dir, f"{timestamp}_fan_rpm_test.log")     
+            try:
+                try:
+                    fan_count = int(self.config['Block1_Thermal']['Test2_Fan_Count'])
+                    fan_ids = [str(i) for i in range(1, fan_count + 1)]
+                except ValueError:
+                    raise Exception("Config Error: Test2_Fan_Count must be an integer")
+
+                sample_count = int(self.config['Block1_Thermal']['Test2_Sample_Count'])
+                levels = ["Test2_Level1", "Test2_Level2", "Test2_Level3"]
+                tool_path = os.path.join(self.base_dir, "RI", "DiagECtool.exe")
+                
+                # A. 切換 Mode Debug
+                self.log("Set Fan Mode: DEBUG")
+                self.exec_cmd_wait(f"{tool_path} fan --mode debug", capture_log=True)
+                
+                all_failures = []
+                
+                with open(log_file, "w") as f:
+                    f.write(f"Timestamp: {timestamp}\n")
+                    f.write(f"Fan Curve Test Start (Count: {fan_count})\n")
+                    f.write("========================================\n")
+
+                # B. 迴圈測試 Levels
+                for level in levels:
+                    # 讀取該 Level 的 Duty (共用)
+                    duty = self.config['Block1_Thermal'][f"{level}_Duty"]
+                    self.log(f"--- Testing {level} (Duty: {duty}) ---")
+                    
+                    # 1. 設定所有風扇的 Duty
+                    for fan_id in fan_ids:
+                        cmd_set = f"{tool_path} fan --set-duty {duty} --id {fan_id}"
+                        self.log(f"Setting Fan {fan_id} Duty: {cmd_set}")
+                        subprocess.run(cmd_set, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    
+                    # 2. 等待穩定
+                    self.log("Waiting 5 seconds for fan to stabilize...")
+                    for _ in range(5):
+                        time.sleep(1)
+                        QApplication.processEvents()
+
+                    # 3. 抓取 RPM 並判定 (針對每個風扇讀取獨立 Spec)
+                    for fan_id in fan_ids:
+                        # 動態組出 Key: Test2_Level1_Fan1_Min
+                        key_min = f"{level}_Fan{fan_id}_Min"
+                        key_max = f"{level}_Fan{fan_id}_Max"
+                        
+                        try:
+                            spec_min = int(self.config['Block1_Thermal'][key_min])
+                            spec_max = int(self.config['Block1_Thermal'][key_max])
+                        except KeyError:
+                            self.log(f"ERROR: Config key '{key_min}' or '{key_max}' missing!")
+                            all_failures.append(f"Config Missing for Fan {fan_id} in {level}")
+                            continue
+
+                        # 抓取 RPM (取樣平均)
+                        rpms = []
+                        for i in range(sample_count):
+                            cmd_get = f"{tool_path} fan --get-rpm --id {fan_id}"
+                            try:
+                                output = subprocess.check_output(cmd_get, shell=True).decode().strip()
+                                val = 0
+                                if ":" in output:
+                                    val = int(output.split(":")[-1].strip())
+                                elif output.isdigit():
+                                    val = int(output)
+                                rpms.append(val)
+                            except:
+                                rpms.append(0)
+                            time.sleep(1)
+                        
+                        avg_rpm = sum(rpms) / len(rpms) if rpms else 0
+                        
+                        result_msg = f"Fan {fan_id} | Duty {duty} | Avg RPM: {avg_rpm:.1f} (Spec: {spec_min}-{spec_max})"
+                        self.log(result_msg)
+                        
+                        with open(log_file, "a") as f:
+                            f.write(f"{datetime.now()} | {result_msg}\n")
+                            f.write(f"    Raw Data: {rpms}\n")
+
+                        if not (spec_min <= avg_rpm <= spec_max):
+                            fail_msg = f"FAIL: Fan {fan_id} Duty {duty} RPM {avg_rpm:.1f} Out of Spec [{spec_min}-{spec_max}]"
+                            all_failures.append(fail_msg)
+                            with open(log_file, "a") as f: f.write(f"    [RESULT] FAIL\n")
+                        else:
+                            with open(log_file, "a") as f: f.write(f"    [RESULT] PASS\n")
+
+                # C. 最終判斷
+                if all_failures:
+                    raise Exception(" | ".join(all_failures))
+
+            except Exception as e:
+                raise e
+                
+            finally:
+                self.log("Teardown: Set Fan Mode AUTO")
+                subprocess.run(f"{tool_path} fan --mode auto", shell=True)
+    # ==========================================
+    # Thermal test 
+    # ==========================================
+    def run_stress_test_common(self, test_name, furmark_cmd, prime95_cmd):
+        self.log(f"[{test_name}] Stress Test Starting...")
+        log_dir = r"C:\Diag\Thermal"
+        os.makedirs(log_dir, exist_ok=True)
+        try:
+            # 動態讀取對應的 Duration (例如 Test1_Duration 或 Test3_Duration)
+            duration = int(self.config['Block1_Thermal'][f'{test_name}_Duration'])
+        except KeyError:
+            self.log(f"Config Error: {test_name}_Duration not found, default to 1200")
+            duration = 1200
+
+        # Log 檔名 (區分 Test1 / Test3)
+        fan_log = os.path.join(log_dir, f"{test_name}_Fan.csv")
+        fan_thread = None
+
+        # 檢查 GPUMon 是否啟用
+        gpumon_keys = [k for k in self.config['Block1_Thermal'] if k.lower().startswith('gpumon_key_')]
+        is_gpumon_enabled = len(gpumon_keys) > 0
+        if is_gpumon_enabled:
+            self.log(f"[{test_name}] GPUMon Enabled.")
+        else:
+            self.log(f"[{test_name}] GPUMon Disabled.")
+        try:
+            # --- 階段 A: 啟動壓力工具 (Staggered Start) ---          
+            # 1. 啟動 Furmark (傳入的指令)
+            self.log(f"Starting Furmark: {furmark_cmd}")
+            p_furmark = subprocess.Popen(furmark_cmd, shell=True)
+            # 等待 10 秒 (讓 GPU warmup and stable)
+            for _ in range(10):
+                self.check_stop()
+                QApplication.processEvents()
+                time.sleep(1)
+
+            # 2. 啟動 Prime95
+            self.log(f"Starting Prime95: {prime95_cmd}")
+            p_prime95 = subprocess.Popen(prime95_cmd, shell=True)
+            
+            # 3. 等待 40 秒 (PTAT 前置緩衝)
+            self.log("Waiting 40s before starting PTAT...")
+            for _ in range(40):
+                self.check_stop()
+                QApplication.processEvents()
+                time.sleep(1)
+
+            # 4. 啟動 PTAT
+            ptat_dir = r"C:\Program Files\Intel Corporation\Intel(R)PTAT"
+            ptat_cmd = "PTAT.exe -start -w=cpu.json"
+            self.log(f"Starting PTAT: {ptat_cmd}")
+            p_ptat = subprocess.Popen(ptat_cmd, cwd=ptat_dir, shell=True)
+
+            # 5. 等待 20 秒 (Fan/GPUMon 前置緩衝)
+            self.log("Waiting 20s before starting Fan Monitor...")
+            for _ in range(20):
+                self.check_stop()
+                QApplication.processEvents()
+                time.sleep(1)
+
+            # 6. 啟動 Fan Monitor
+            fan_thread = FanMonitorThread(fan_log)
+            fan_thread.start()
+
+            # 7. 啟動 GPUMon (若啟用)
+            if is_gpumon_enabled:
+                gpu_mon_dir = os.path.join(self.base_dir, "RI", "GPUMon")
+                if not os.path.exists(gpu_mon_dir): os.makedirs(gpu_mon_dir)
+                
+                # 這裡 Log 檔名先用暫存的，最後再備份改名
+                gpu_temp_log = "cpu_gpumon.csv" 
+                gpu_cmd = f"GPUMonCmd.exe -custom:timestamp,temp,pwr,clk -wake -log:{gpu_temp_log}"
+                self.log(f"Starting GPUMon: {gpu_cmd}")
+                p_gpumon = subprocess.Popen(gpu_cmd, cwd=gpu_mon_dir, shell=True)
+
+            # --- 階段 B: 正式燒機測試 ---
+            self.log(f"Running Stress for {duration} seconds...")
+            for i in range(duration):
+                if i % 10 == 0: QApplication.processEvents()
+                self.check_stop()
+                time.sleep(1)
+
+        except Exception as e:
+            self.log(f"[{test_name}] Interrupted or Error: {e}")
+            raise e
+
+        finally:
+            # --- 階段 C: Teardown (停止工具) ---
+            self.log("Stopping Tools (Teardown)...")           
+            # 1. 停 PTAT (並等待寫入)
+            ptat_dir = r"C:\Program Files\Intel Corporation\Intel(R)PTAT"
+            ptat_cmd = "PTAT.exe -stop"
+            p_ptat = subprocess.Popen(ptat_cmd, cwd=ptat_dir, shell=True)
+            try:
+                p_ptat.wait(timeout=60)
+            except:
+                pass            
+            self.log("Waiting 15s for PTAT logs...")
+            # 關鍵: 保持 Prime95/Furmark 活著，等待 PTAT 寫完
+            for i in range(15):
+                if i % 10 == 0: QApplication.processEvents()
+                time.sleep(1)           
+            self.ensure_process_killed("PTAT.exe")           
+            # 2. 停 GPUMon
+            if is_gpumon_enabled:
+                self.ensure_process_killed("GPUMonCmd.exe")           
+            # 3. 停 Fan Monitor
+            if fan_thread: fan_thread.stop()
+            
+            # 4. 停 Stress Tools (最後才殺)
+            self.ensure_process_killed("prime95.exe")
+            # 殺 Furmark (注意: FurMark GUI 與 CLI 可能名稱不同，通殺)
+            self.ensure_process_killed("FurMark_GUI.exe")
+            self.ensure_process_killed("furmark.exe")           
+            # 釋放資源
+            for i in range(10):
+                if i % 10 == 0: QApplication.processEvents()
+                time.sleep(1)  
+
+        # --- 階段 D: 結果驗證 ---
+        self.log(f"=== Verifying {test_name} Results ===")
+        all_failures = []
+        
+        # 1. 備份與檢查 Fan Log
+        if test_name == "Test1":
+            self.archive_fan_log(fan_log, f"CPU_only_Fan")
+        else:
+            self.archive_fan_log(fan_log, f"Dual_Fan")
+        try:
+            # 讀取對應 Test1 或 Test3 的 Fan Spec
+            spec_min = int(self.config['Block1_Thermal'][f'{test_name}_Fan_Min'])
+            spec_max = int(self.config['Block1_Thermal'][f'{test_name}_Fan_Max'])
+            
+            avg_fan1 = self.analyze_fan_log_average(fan_log, 1) 
+            avg_fan2 = self.analyze_fan_log_average(fan_log, 2) 
+            
+            if not (spec_min <= avg_fan1 <= spec_max) or not (spec_min <= avg_fan2 <= spec_max):
+                msg = f"Fan RPM FAIL: Fan1={avg_fan1}, Fan2={avg_fan2} (Spec: {spec_min}-{spec_max})"
+                self.log(msg)
+                all_failures.append(msg)
+            else:
+                self.log(f"Fan RPM PASS: {avg_fan1}, {avg_fan2}")           
+        except Exception as e:
+            all_failures.append(f"Fan Check Error: {e}")
+
+        # 2. 備份與檢查 PTAT Log
+        user_home = os.path.expanduser("~")
+        ptat_log_dir = os.path.join(user_home, "Documents", "iPTAT", "log")           
+        ptat_log = self.find_latest_log(ptat_log_dir, prefix="PTATMonitor")
+        if ptat_log:
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            # 檔名加入 test_name (例如 Test3_CPU_PTAT.csv)
+            if test_name == "Test1":
+                new_filename = f"{timestamp}_CPU_only_PTAT.csv"
+            else:
+                new_filename = f"{timestamp}_Dual_PTAT.csv"
+            dest_path = os.path.join(log_dir, new_filename)
+            try:
+                shutil.copy2(ptat_log, dest_path)
+                # 傳入 test_mode=test_name，這樣就會去讀 Test3_Low/High
+                ptat_errors = self.check_ptat_metrics(dest_path, test_mode=test_name) 
+                if ptat_errors:
+                    all_failures.extend(ptat_errors)
+                else:
+                    self.log("PTAT Check PASS.")
+            except Exception as e:
+                all_failures.append(f"PTAT Error: {e}")
+        else:
+            all_failures.append("PTAT Log missing")
+
+        # 3. 備份與檢查 GPUMon Log
+        if is_gpumon_enabled:
+            gpu_mon_dir = os.path.join(self.base_dir, "RI", "GPUMon")
+            src_gpu_log = os.path.join(gpu_mon_dir, "cpu_gpumon.csv")        
+            if os.path.exists(src_gpu_log):
+                timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+                # 檔名加入 test_name
+                dest_gpu_name = f"{timestamp}_{test_name}_GPUMon.csv"
+                dest_gpu_path = os.path.join(log_dir, dest_gpu_name)              
+                try:
+                    shutil.copy2(src_gpu_log, dest_gpu_path)
+                    # 傳入 test_mode=test_name
+                    gpu_errors = self.check_gpumon_metrics(dest_gpu_path, test_mode=test_name)
+                    if gpu_errors:
+                        all_failures.extend(gpu_errors)
+                    else:
+                        self.log("GPUMon Check PASS.")                       
+                except Exception as e:
+                    all_failures.append(f"GPUMon Error: {e}")
+            else:
+                self.log("WARNING: GPUMon Log missing!")
+                all_failures.append("GPUMon Log missing")
+
+        # 最終判定
+        if all_failures:
+            error_summary = " | ".join(all_failures)
+            raise Exception(f"{test_name} FAILED: {error_summary}")
+        
+        self.log(f"{test_name} ALL PASS.")
     # ==========================================
     # Block 1 實作 (Thermal)
     # ==========================================
@@ -438,8 +756,7 @@ class ODM_RunIn_Project(BaseRunInApp):
         # Step 0: 電量檢查
         if start_from_step == 0:
             threshold = int(self.config['Block1_Thermal']['Start_Battery_Threshold'])
-            self.log(f"Step 0: Waiting for Battery > {threshold}%...")
-            
+            self.log(f"Step 0: Waiting for Battery > {threshold}%...")          
             while True:
                 # [安全修正] 檢查停止訊號
                 self.check_stop()
@@ -471,207 +788,67 @@ class ODM_RunIn_Project(BaseRunInApp):
         # ==========================================
         if start_from_step <= 1:
             self.log("[Test 1] Single Stress Start")
-            duration = int(self.config['Block1_Thermal']['Test1_Duration'])
-            fan_log = os.path.join(log_dir, "CPU_Fan.csv")
-            fan_thread = None
-            gpumon_keys = [k for k in self.config['Block1_Thermal'] if k.lower().startswith('gpumon_key_')]
-            is_gpumon_enabled = len(gpumon_keys) > 0
-            if is_gpumon_enabled:
-                self.log(f"GPUMon Enabled (Found {len(gpumon_keys)} keys).")
-            else:
-                self.log("GPUMon Disabled (No keys found in Config).")
+            cmd_prime95 = r".\RI\prime95\prime95.exe -t -small -A16"
+            cmd_furmark = r"start .\RI\FurMark\FurMark_GUI.exe"
             try:
-                # 1. 啟動 Prime95 (Tool) & Furmark
-                cmd_furmark = r"start .\RI\FurMark\FurMark_GUI.exe"
-                self.log(f"Starting furmark: {cmd_furmark}")
-                p_stress = subprocess.Popen(cmd_furmark, shell=True)
-
-                for _ in range(10):
-                    self.check_stop() # [安全修正] 檢查 STOP
-                    QApplication.processEvents()
-                    time.sleep(1)
-
-                cmd_stress = r".\RI\prime95\prime95.exe -t -small -A16"
-                self.log(f"Starting Prime95: {cmd_stress}")
-                p_stress = subprocess.Popen(cmd_stress, shell=True)
+                # 呼叫共用函式: 傳入 "Test1"
+                self.run_stress_test_common("Test1", cmd_furmark, cmd_prime95)
                 
-                # 2. 等待 40 秒
-                self.log("Waiting 40s before starting PTAT...")
-                for _ in range(40):
-                    self.check_stop() # [安全修正] 檢查 STOP
-                    QApplication.processEvents()
-                    time.sleep(1)
-
-                # 3. 啟動 PTAT (Monitor)
-                ptat_dir = r"C:\Program Files\Intel Corporation\Intel(R)PTAT"
-                ptat_cmd = "PTAT.exe -start -w=cpu.json"
-                self.log(f"Starting PTAT: {ptat_cmd}")
-                p_ptat = subprocess.Popen(ptat_cmd, cwd=ptat_dir, shell=True)
-
-                # 4. 等待 20 秒
-                self.log("Waiting 20s before starting Fan Monitor...")
-                for _ in range(20):
-                    self.check_stop() # [安全修正] 檢查 STOP
-                    QApplication.processEvents()
-                    time.sleep(1)
-
-                # 5. 啟動 Fan Monitor
-                fan_thread = FanMonitorThread(fan_log)
-                fan_thread.start()
-
-                # --- [新增] 啟動 GPUMon ---
-                if is_gpumon_enabled:
-                    gpu_mon_dir = os.path.join(self.base_dir, "RI", "GPUMon")
-                    # 確保資料夾存在，若無則建立(或是依賴已經存在)
-                    if not os.path.exists(gpu_mon_dir): os.makedirs(gpu_mon_dir)
-                    # 指令: -custom:timestamp,temp,pwr,clk -wake -log:cpu_gpumon.csv
-                    gpu_cmd = "GPUMonCmd.exe -custom:timestamp,temp,pwr,clk -wake -log:cpu_gpumon.csv"
-                    self.log(f"Starting GPUMon: {gpu_cmd}")
-                    # 設定 cwd 為 RI\GPUMon，這樣 log 才會產在該資料夾內
-                    p_gpumon = subprocess.Popen(gpu_cmd, cwd=gpu_mon_dir, shell=True)
-
-                # 6. 正式等待測試時間
-                self.log(f"Running Stress for {duration} seconds...")
-                for i in range(duration):
-                    if i % 10 == 0: QApplication.processEvents()
-                    self.check_stop()
-                    time.sleep(1)
-
+                # 若沒拋出 Exception 代表 PASS
+                self.save_state("1", 2, current_cycle, status="IDLE")
+                if self.config['Block1_Thermal'].getboolean('Test1_Reboot'):
+                    self.log("Rebooting as per config...")
+                    self.trigger_reboot()
             except Exception as e:
-                self.log(f"Test 1 Interrupted or Error: {e}")
-                raise e # 往上拋，讓主流程處理停止
-
-            finally:
-                # Teardown: 確保工具被殺掉 (無論是按 Stop 還是正常結束)
-                self.log("Stopping Tools (Teardown)...")                
-                # A. 殺 PTAT
-                ptat_dir = r"C:\Program Files\Intel Corporation\Intel(R)PTAT"
-                ptat_cmd = "PTAT.exe -stop"
-                self.log(f"Stop PTAT: {ptat_cmd}")
-                p_ptat = subprocess.Popen(ptat_cmd, cwd=ptat_dir, shell=True)
-                try:
-                    p_ptat.wait(timeout=60)
-                except:
-                    pass
-                self.log("Waiting for PTAT to finish writing log...")
-                self.ensure_process_killed("PTAT.exe")
-                self.ensure_process_killed("GPUMonCmd.exe")
-                for i in range(15):
-                    if i % 10 == 0: QApplication.processEvents()
-                    time.sleep(1)
-                time.sleep(1) # 稍等檔案釋放
-                # B. 停 Fan Monitor
-                if fan_thread:
-                    fan_thread.stop()
-                #self.ensure_process_killed("FanControl.exe")
-                
-                # C. 殺 Prime95
-                self.ensure_process_killed("prime95.exe")                
-                time.sleep(2) 
-                self.ensure_process_killed("FurMark_GUI.exe")  
-                time.sleep(2) 
-            # 8. 結果判定 (若前面被 Stop 中斷，這裡不會執行)
-            self.log("Verifying Results...")
-            all_failures = [] #錯誤收集器
-            self.archive_fan_log(fan_log, "CPU_Fan")
-            # (A) Fan Check
-            # 讀取 Config
-            try:
-                spec_min = int(self.config['Block1_Thermal']['Test1_Fan_Min'])
-                spec_max = int(self.config['Block1_Thermal']['Test1_Fan_Max'])
-                self.log(f"CPU only fan spec_min:{spec_min}, CPU only fan spec_max:{spec_max}")
-                avg_fan1 = self.analyze_fan_log_average(fan_log, 1) 
-                avg_fan2 = self.analyze_fan_log_average(fan_log, 2) 
-                if not (spec_min <= avg_fan1 <= spec_max) or not (spec_min <= avg_fan2 <= spec_max):
-                    msg = f"Fan RPM FAIL: Fan1={avg_fan1}, Fan2={avg_fan2} (Spec: {spec_min}-{spec_max})"
-                    self.log(msg)
-                    all_failures.append(msg)
-                else:
-                    self.log(f"Fan RPM PASS: {avg_fan1}, {avg_fan2}")           
-            except Exception as e:
-                msg = f"Fan Check Error: {e}"
-                self.log(msg)
-                all_failures.append(msg)
-            # (B) PTAT Check
-            user_home = os.path.expanduser("~")
-            ptat_log_dir = os.path.join(user_home, "Documents", "iPTAT", "log")           
-            ptat_log = self.find_latest_log(ptat_log_dir, prefix="PTATMonitor")
-            if ptat_log:
-                timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-                new_filename = f"{timestamp}_CPU_PTAT.csv"
-                dest_path = os.path.join(log_dir, new_filename)
-                
-                try:
-                    self.log(f"Copying PTAT Log to {dest_path}...")
-                    shutil.copy2(ptat_log, dest_path)
-                    
-                    # 使用複製後的檔案進行檢查
-                    ptat_errors = self.check_ptat_metrics(dest_path, test_mode="Test1") 
-                    if ptat_errors:
-                        all_failures.extend(ptat_errors) # 將 PTAT 錯誤加入總名單
-                    else:
-                        self.log("PTAT Check PASS (All items).")
-                except Exception as e:
-                    msg = f"PTAT File Process Error: {e}"
-                    self.log(msg)
-                    all_failures.append(msg)
-            else:
-                self.log(f"WARNING: No PTAT Log found in {ptat_log_dir}")
-                all_failures.append("PTAT Log missing")
-            # --- [新增] 3. GPUMon Check ---
-            # 來源檔案: RI\GPUMon\cpu_gpumon.csv
-            src_gpu_log = os.path.join(gpu_mon_dir, "cpu_gpumon.csv")        
-            if os.path.exists(src_gpu_log):
-                # 備份檔案: C:\Diag\Thermal\TIMESTAMP_Test1_GPUMon.csv
-                timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-                dest_gpu_name = f"{timestamp}_Test1_GPUMon.csv"
-                dest_gpu_path = os.path.join(log_dir, dest_gpu_name)              
-                try:
-                    shutil.copy2(src_gpu_log, dest_gpu_path)
-                    self.log(f"GPUMon Log archived: {dest_gpu_name}")                    
-                    # 執行檢查 (Test1)
-                    gpu_errors = self.check_gpumon_metrics(dest_gpu_path, test_mode="Test1")
-                    if gpu_errors:
-                        all_failures.extend(gpu_errors)
-                    else:
-                        self.log("GPUMon Check PASS.")                       
-                except Exception as e:
-                    self.log(f"GPUMon Copy/Check Error: {e}")
-                    all_failures.append(f"GPUMon Error: {e}")
-            else:
-                self.log("WARNING: GPUMon Log not found!")
-                all_failures.append("GPUMon Log missing") # 視需求開啟            
-            # ==========================================
-            # 最終判定 (若有任何錯誤，才 Raise)
-            # ==========================================
-            if all_failures:
-                # 將所有錯誤組合成一個字串拋出
-                error_summary = " | ".join(all_failures)
-                raise Exception(f"Test 1 FAILED: {error_summary}")
-            
-            self.log("Test 1 PASS.")
-            # 9. Reboot Check
-            self.save_state("1", 2, current_cycle, status="IDLE")
-            if self.config['Block1_Thermal'].getboolean('Test1_Reboot'):
-                self.log("Rebooting as per config...")
-                self.trigger_reboot()
-            else:
-                self.log("Continuing to next step...")
-
+                # 錯誤已在 run_stress_test_common Log 過，這裡直接往上拋即可
+                raise e
         # Step 2: Fan Max Speed
         if start_from_step <= 2:
-            self.log("[Test 2] Fan Max Speed")
-            self.exec_cmd_wait(r"call .\RI\Thermal_Fan.bat")
-            
-            self.save_state("1", 3, current_cycle, status="IDLE")
-            if self.config['Block1_Thermal'].getboolean('Test2_Reboot'):
-                self.log("Rebooting for Test 3...")
-                self.trigger_reboot()
-
+            self.log("Sleep 3min before Fan test...")         
+            for i in range(180):
+                if i % 10 == 0: QApplication.processEvents()
+                time.sleep(1)
+            self.log("[Test 2] Fan Speed Test Start")         
+            try:
+                # 呼叫剛剛寫好的 Helper 函式
+                self.run_fan_curve_test()
+                self.log("Test 2 PASS.")               
+                # 測試通過後，儲存狀態並準備重開機
+                self.save_state("1", 3, current_cycle, status="IDLE")                
+                # 檢查 Config 是否需要重開機 (需求說 PASS 後 Reboot 往 Test 3)
+                if self.config['Block1_Thermal'].getboolean('Test2_Reboot'):
+                    self.log("Rebooting for Test 3...")
+                    self.trigger_reboot()
+                else:
+                    self.log("Skipping Reboot, moving to Test 3...")
+            except Exception as e:
+                self.log(f"Test 2 FAILED: {e}")
+                # 這裡直接 raise，core.py 會捕捉並停止測試 (STOPPED: FAIL)
+                raise e           
         # Step 3: Dual Stress
         if start_from_step <= 3:
-            self.log("[Test 3] Dual Stress")
-            self.exec_cmd_wait(r"call .\RI\Thermal_Dual.bat")
+            self.log("Sleep 3min before Dual burn test...")         
+            for i in range(180):
+                if i % 10 == 0: QApplication.processEvents()
+                time.sleep(1)
+            self.log("[Test 3] Dual Stress Test")
+            cmd_prime95 = r".\RI\prime95\prime95.exe -t -small -A16"
+            cmd_furmark = r".\RI\FurMark\furmark.exe --demo furmark-gl --benchmark --max-time 1390 --no-score-box"
+            try:
+                # 呼叫共用函式: 傳入 "Test3"
+                self.run_stress_test_common("Test3", cmd_furmark, cmd_prime95)
+                self.log("Block 1 PASS. Moving to Block 2...")               
+               
+                # 若為最後一個 Step，準備接續
+                if self.config['Block1_Thermal'].getboolean('Test3_Reboot'):
+                     self.log("Rebooting before Block 2...")
+                     self.save_state("2", 0, current_cycle, status="IDLE")
+                     self.trigger_reboot()
+                else:
+                     self.save_state("2", 0, current_cycle, status="IDLE")
+
+            except Exception as e:
+                raise e
             self.log("Block 1 PASS. Moving to Block 2...")
             
             if self.config['Block1_Thermal'].getboolean('Test3_Reboot'):
