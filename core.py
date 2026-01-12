@@ -10,7 +10,7 @@ from datetime import datetime
 # --- PyQt5 修改區 ---
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QTextEdit, QLabel, QPushButton)
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtCore import QThread, pyqtSignal, Qt
 # --------------------
 
 class RunInWorker(QThread):
@@ -39,7 +39,7 @@ class BaseRunInApp(QMainWindow):
         super().__init__()
         self.setWindowTitle(title)
         self.resize(800, 600)
-        
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
         # --- 變數初始化 ---
         self.current_proc = None 
         self.stop_flag = False
