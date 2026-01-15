@@ -166,11 +166,15 @@ class BaseRunInApp(QMainWindow):
         
         self.btn_stop.setEnabled(False)
         self.btn_start.setEnabled(False)
-        
-        tool_path = os.path.join(self.base_dir, "RI", "DiagECtool.exe") 
-        self.exec_cmd_wait(f"{tool_path} battery --mode auto", capture_log=True)
-        self.exec_cmd_wait(f"{tool_path} fan --mode auto", capture_log=True)
-        
+        tool_path = os.path.join(self.base_dir, "RI", "DiagECtool.exe")
+        try:
+            self.log("Resetting Battery Mode...")
+            subprocess.run(f"{tool_path} battery --mode auto", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)      
+            self.log("Resetting Fan Mode...")
+            subprocess.run(f"{tool_path} fan --mode auto", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            self.log(f"Error resetting hardware: {e}")
+
         if self.current_proc:
             try:
                 if self.current_proc.poll() is None:
@@ -354,9 +358,15 @@ class BaseRunInApp(QMainWindow):
     def on_finished(self, passed):
         # 決定最終結果：必須是 passed 為 True 且沒有被 STOP
         final_result = passed and not self.stop_flag
-        tool_path = os.path.join(self.base_dir, "RI", "DiagECtool.exe") 
-        self.exec_cmd_wait(f"{tool_path} battery --mode auto", capture_log=True)
-        self.exec_cmd_wait(f"{tool_path} fan --mode auto", capture_log=True)
+
+        if not self.stop_flag:
+            tool_path = os.path.join(self.base_dir, "RI", "DiagECtool.exe") 
+            try:
+                self.exec_cmd_wait(f"{tool_path} battery --mode auto", capture_log=True)
+                self.exec_cmd_wait(f"{tool_path} fan --mode auto", capture_log=True)
+            except Exception as e:
+                self.log(f"Cleanup warning: {e}")
+
         if self.stop_flag:
             self.log("=== TEST STOPPED BY USER (Please Restart Application) ===")
             self.set_status("TEST STOPPED")
@@ -381,7 +391,7 @@ class BaseRunInApp(QMainWindow):
                 self.btn_start.setStyleSheet("background-color: #D50000; color: white; font-weight: bold; font-size: 36px;")
                 self.log("=== TEST STOPPED: FAIL ===")
         
-        # [新增] 產生結果檔
+        # 產生結果檔
         self.generate_result_file(final_result)     
         self.archive_log()
 
@@ -389,6 +399,14 @@ class BaseRunInApp(QMainWindow):
         if self.is_rebooting:
             event.accept()
             return
+        
+        # --- 安全停止 Worker ---
+        if hasattr(self, 'worker') and self.worker.isRunning():
+            self.log("Close event detected. Stopping worker thread...")
+            self.stop_flag = True  # 通知 Worker 停止
+            # 嘗試等待一下讓 Worker 收屍 (選用，避免卡住 UI 太久)
+            self.worker.wait(10000) 
+        # -----------------------------
         
         if os.path.exists(self.current_log_file):
             self.log("User closed the application (Manual Abort).")
