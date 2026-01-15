@@ -29,17 +29,17 @@ class FanMonitorThread(QThread):
         # 寫入 CSV Header
         with open(self.csv_path, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(["Timestamp", "Fan1_RPM", "Fan2_RPM"])
+            writer.writerow(["Timestamp", "Fan1_RPM", "Fan2_RPM", "ts2"])
 
         while self.running:
             try:
                 now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 rpm1 = self.get_rpm(1)
                 rpm2 = self.get_rpm(2)
-                
+                ts2 = self.get_ts2()
                 with open(self.csv_path, 'a', newline='') as f:
                     writer = csv.writer(f)
-                    writer.writerow([now, rpm1, rpm2])
+                    writer.writerow([now, rpm1, rpm2, ts2])
             except Exception as e:
                 pass 
 
@@ -52,6 +52,24 @@ class FanMonitorThread(QThread):
         try:
             # 假設 DiagECtool 在 .\RI 目錄下
             cmd = f".\\RI\\DiagECtool.exe fan --get-rpm --id {fan_id}"
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            output = subprocess.check_output(cmd, startupinfo=si, shell=True).decode().strip()
+            
+            # 解析 "Fan RPM: 3000" 格式
+            if ":" in output:
+                val_str = output.split(":")[-1].strip()
+                return int(val_str) if val_str.isdigit() else 0
+            
+            # 若直接回傳數字
+            return int(output) if output.isdigit() else 0
+        except:
+            return 0
+        
+    def get_ts2(self):
+        try:
+            # 假設 DiagECtool 在 .\RI 目錄下
+            cmd = f".\\RI\\DiagECtool.exe temp --sensor ts2"
             si = subprocess.STARTUPINFO()
             si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             output = subprocess.check_output(cmd, startupinfo=si, shell=True).decode().strip()
