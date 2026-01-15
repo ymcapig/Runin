@@ -5,6 +5,7 @@ import psutil
 import csv
 import subprocess
 import threading
+import ctypes
 import shutil  # 用於複製檔案
 from datetime import datetime, timedelta
 from PyQt5.QtWidgets import QApplication, QMessageBox
@@ -78,6 +79,12 @@ class ODM_RunIn_Project(BaseRunInApp):
         super().__init__(title=title)   
         # 設定一個 Timer，在介面顯示後 1 秒檢查是否要 Auto Run
         # 這樣可以確保 UI 已經完全 Load 好
+        if getattr(sys, 'frozen', False):
+            # 打包後：抓 .exe 的位置
+            self.base_dir = os.path.dirname(sys.executable)
+        else:
+            # 開發時：抓 .py 的位置
+            self.base_dir = os.path.dirname(os.path.abspath(__file__))
         QTimer.singleShot(1000, self.check_auto_run)
 
     # Auto Run 檢查邏輯
@@ -112,6 +119,9 @@ class ODM_RunIn_Project(BaseRunInApp):
             self.log(f">>> RESUMING Block {current_block}, Step {current_step} <<<")
 
             # 偵測非預期當機 (上次狀態仍為 RUNNING)
+            if last_status == "REBOOTING":
+                self.log(">>> System returned from Reboot Test. Resuming...")
+
             if last_status == "RUNNING":
                 self.log(f"!!! DETECTED CRASH/HANG AT BLOCK {current_block} STEP {current_step} !!!")
                 self.log("Marking this step as FAIL and skipping...")
@@ -157,7 +167,7 @@ class ODM_RunIn_Project(BaseRunInApp):
         # ---------------------------------------------------
         if current_block == "3":
             if self.config['Block3_Battery'].getboolean('Enabled'):
-                self.run_block_3()
+                self.run_block_3(current_cycle=current_cycle)
             else:
                 self.log("Block 3 is Disabled. Skipping...")
 
@@ -172,8 +182,8 @@ class ODM_RunIn_Project(BaseRunInApp):
                 # 設定狀態回到 Block 1, Step 0，並更新 Cycle數
                 self.save_state("1", 0, next_cycle, status="IDLE")
                 # 為了確保測試環境乾淨，通常建議重開機進入下一輪
-                # self.log("Rebooting system for the next cycle...")
-                # self.trigger_reboot()
+                self.log("Rebooting system for the next cycle...")
+                self.trigger_reboot()
                 return # 結束本次執行，等待重開機
             
             self.clear_state()
@@ -270,8 +280,12 @@ class ODM_RunIn_Project(BaseRunInApp):
                             
                             full_time_str = f"{date_str} {time_str}"
                             # 解析合併後的時間
-                            t_obj = datetime.strptime(full_time_str, '%m/%d/%Y %H:%M:%S.%f')
-                            
+                            try:
+                                # 嘗試使用 DD/MM/YYYY (適配您目前的 CSV)
+                                t_obj = datetime.strptime(full_time_str, '%d/%m/%Y %H:%M:%S.%f')
+                            except ValueError:
+                                # 若失敗，嘗試原本的 MM/DD/YYYY (相容舊格式)
+                                t_obj = datetime.strptime(full_time_str, '%m/%d/%Y %H:%M:%S.%f')                            
                             if t_obj >= cutoff_time:
                                 values.append(float(row[col_idx]))
                         except ValueError:
@@ -368,7 +382,47 @@ class ODM_RunIn_Project(BaseRunInApp):
                 self.log(f"WARNING: Invalid value for [{target_col_name}]")
         
         return errors
-    
+
+    def get_ptat_avg_power_value(self, csv_path, test_mode="Test1"):
+        self.log(f"Calculating PTAT Power Avg ({test_mode})...") # Log 可視需求開關        
+        if not os.path.exists(csv_path): 
+            return 0.0
+
+        # 1. 找出 Config 定義的 Watt Key (只取第一個找到的)
+        target_col_name = None
+        for key, value in self.config['Block1_Thermal'].items():
+            if key.lower() == 'ptat_watt_key': # 精確比對 key 名稱
+                target_col_name = value
+                break
+        
+        if not target_col_name:
+            target_col_name = "Power-Package Power(Watts)"
+
+        try:
+            # 2. 讀取 Header 並找 Index
+            col_idx = -1
+            with open(csv_path, 'r', encoding='utf-8', errors='ignore') as f:
+                reader = csv.reader(f)
+                headers = next(reader, None)
+                if headers:
+                    # 去除空白並比對
+                    clean_headers = [h.strip() for h in headers]
+                    if target_col_name in clean_headers:
+                        col_idx = clean_headers.index(target_col_name)
+            
+            if col_idx != -1:
+                # 3. 呼叫底層函式計算 (重用 analyze_ptat_log)
+                avg_val = self.analyze_ptat_log(csv_path, col_idx, duration_sec=120)
+                # self.log(f"PTAT Power ({target_col_name}): {avg_val:.2f} W")
+                return avg_val
+            else:
+                self.log(f"Warning: PTAT Watt Key '{target_col_name}' not found in CSV.")
+                return 0.0
+
+        except Exception as e:
+            self.log(f"Error getting PTAT power: {e}")
+            return 0.0
+        
     def analyze_gpumon_log(self, csv_path, col_idx, duration_sec=120):
         if not os.path.exists(csv_path): return 0.0
         values = []
@@ -403,6 +457,7 @@ class ODM_RunIn_Project(BaseRunInApp):
             self.log(f"GPUMon Analysis Error: {e}")
             return 0.0
     
+
     def check_gpumon_metrics(self, csv_path, test_mode="Test1"):
         self.log(f"Verifying GPUMon Metrics ({test_mode})...")
         errors = []       
@@ -443,13 +498,74 @@ class ODM_RunIn_Project(BaseRunInApp):
                 errors.append(f"GPUMon Config Error [{target_col}]: {e}")               
         return errors
     
+    def get_gpumon_power_avg(self, csv_path, test_mode="Test1"):
+        # self.log(f"Calculating GPUMon Power Avg ({test_mode})...")
+        
+        if not os.path.exists(csv_path):
+            return 0.0
+            
+        target_col_name = None
+        for key, value in self.config['Block1_Thermal'].items():
+            if key.lower() == 'gpumon_watt_key':
+                target_col_name = value
+                break
+        
+        if not target_col_name:
+            target_col_name = "1:TGP (W)" # 預設值
+
+        try:
+            col_idx = -1
+            with open(csv_path, 'r', encoding='utf-8', errors='ignore') as f:
+                reader = csv.reader(f)
+                headers = next(reader, None)
+                if headers:
+                    clean_headers = [h.strip() for h in headers]
+                    if target_col_name in clean_headers:
+                        col_idx = clean_headers.index(target_col_name)
+
+            if col_idx != -1:
+                # 這裡假設 analyze_gpumon_log 參數與 analyze_ptat_log 類似
+                # 如果 analyze_gpumon_log 邏輯不同，請對應調整
+                avg_val = self.analyze_gpumon_log(csv_path, col_idx, duration_sec=120)                
+                if test_mode == "Test1": return 0.0                 
+                self.log(f"GPUMon Power ({target_col_name}): {avg_val:.2f} W")
+                return avg_val
+            else:
+                return 0.0
+
+        except Exception as e:
+            self.log(f"Error getting GPUMon power: {e}")
+            return 0.0
+    # ==========================================
+    # Helper: 取得風扇轉速 (單純讀取版)
+    # ==========================================
+    def get_fan_rpm(self, fan_id, tool_path):
+        """
+        執行指令取得 RPM，不包含 Retry 邏輯。
+        回傳: int (若失敗或無法解析則回傳 0)
+        """
+        cmd = f'"{tool_path}" fan --get-rpm --id {fan_id}'
+        try:
+            # 執行指令並抓取輸出
+            output = subprocess.check_output(cmd, shell=True).decode().strip()
+            
+            # 解析 "Fan RPM: 3000" 或 純數字
+            if ":" in output:
+                val_str = output.split(":")[-1].strip()
+                return int(val_str) if val_str.isdigit() else 0
+            
+            return int(output) if output.isdigit() else 0
+        except Exception:
+            return 0
+        
     def run_fan_curve_test(self):
-            self.log("[Fan Curve Test] Starting...")
+            self.log("[Fan Speed Test] Starting...")
             
             log_dir = r"C:\Diag\Thermal"
             os.makedirs(log_dir, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            log_file = os.path.join(log_dir, f"{timestamp}_fan_rpm_test.log")     
+            log_file = os.path.join(log_dir, f"{timestamp}_fan_rpm_test.log")   
+            tool_path = os.path.join(self.base_dir, "RI", "DiagECtool.exe")  
             try:
                 try:
                     fan_count = int(self.config['Block1_Thermal']['Test2_Fan_Count'])
@@ -457,10 +573,12 @@ class ODM_RunIn_Project(BaseRunInApp):
                 except ValueError:
                     raise Exception("Config Error: Test2_Fan_Count must be an integer")
 
-                sample_count = int(self.config['Block1_Thermal']['Test2_Sample_Count'])
-                levels = ["Test2_Level1", "Test2_Level2", "Test2_Level3"]
-                tool_path = os.path.join(self.base_dir, "RI", "DiagECtool.exe")
-                
+                try:
+                    sample_count = int(self.config['Block1_Thermal']['Test2_Sample_Count'])
+                    target_duty = self.config['Block1_Thermal']['Test2_Duty']   
+                    retry_limit = int(self.config['Block1_Thermal'].get('Fan_Retry_Count', '3'))
+                except KeyError as e:
+                    raise Exception(f"Config Error: Missing key {e}")                                
                 # A. 切換 Mode Debug
                 self.log("Set Fan Mode: DEBUG")
                 self.exec_cmd_wait(f"{tool_path} fan --mode debug", capture_log=True)
@@ -469,60 +587,57 @@ class ODM_RunIn_Project(BaseRunInApp):
                 
                 with open(log_file, "w") as f:
                     f.write(f"Timestamp: {timestamp}\n")
-                    f.write(f"Fan Curve Test Start (Count: {fan_count})\n")
+                    f.write(f"Fan Test Start (Count: {fan_count}, Target Duty: {target_duty}%)\n")
+                    f.write(f"Retry Limit: {retry_limit}\n")
                     f.write("========================================\n")
 
                 # B. 迴圈測試 Levels
-                for level in levels:
-                    # 讀取該 Level 的 Duty (共用)
-                    duty = self.config['Block1_Thermal'][f"{level}_Duty"]
-                    self.log(f"--- Testing {level} (Duty: {duty}) ---")
+                try:
+                    self.log(f"--- Testing Duty {target_duty}% ---")
                     
-                    # 1. 設定所有風扇的 Duty
+                    # 2. 設定所有風扇的 Duty
                     for fan_id in fan_ids:
-                        cmd_set = f"{tool_path} fan --set-duty {duty} --id {fan_id}"
+                        cmd_set = f"{tool_path} fan --set-duty {target_duty} --id {fan_id}"
                         self.log(f"Setting Fan {fan_id} Duty: {cmd_set}")
                         subprocess.run(cmd_set, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     
-                    # 2. 等待穩定
+                    # 3. 等待穩定
                     self.log("Waiting 5 seconds for fan to stabilize...")
                     for _ in range(5):
                         time.sleep(1)
                         QApplication.processEvents()
 
-                    # 3. 抓取 RPM 並判定 (針對每個風扇讀取獨立 Spec)
+                    # 4. 抓取 RPM 並判定
                     for fan_id in fan_ids:
-                        # 動態組出 Key: Test2_Level1_Fan1_Min
-                        key_min = f"{level}_Fan{fan_id}_Min"
-                        key_max = f"{level}_Fan{fan_id}_Max"
+                        # Key 變更為 Test2_FanX_Min/Max (移除 Level 字眼)
+                        key_min = f"Test2_Fan{fan_id}_Min"
+                        key_max = f"Test2_Fan{fan_id}_Max"
                         
                         try:
                             spec_min = int(self.config['Block1_Thermal'][key_min])
                             spec_max = int(self.config['Block1_Thermal'][key_max])
                         except KeyError:
                             self.log(f"ERROR: Config key '{key_min}' or '{key_max}' missing!")
-                            all_failures.append(f"Config Missing for Fan {fan_id} in {level}")
+                            all_failures.append(f"Config Missing for Fan {fan_id}")
                             continue
 
                         # 抓取 RPM (取樣平均)
                         rpms = []
                         for i in range(sample_count):
-                            cmd_get = f"{tool_path} fan --get-rpm --id {fan_id}"
-                            try:
-                                output = subprocess.check_output(cmd_get, shell=True).decode().strip()
-                                val = 0
-                                if ":" in output:
-                                    val = int(output.split(":")[-1].strip())
-                                elif output.isdigit():
-                                    val = int(output)
-                                rpms.append(val)
-                            except:
-                                rpms.append(0)
-                            time.sleep(1)
-                        
+                            val = 0
+                            # [新增] Retry 機制：判斷 0 或 異常大值
+                            for attempt in range(retry_limit):
+                                val = self.get_fan_rpm(fan_id, tool_path)                          
+                                # 若數值合理，直接跳出重試迴圈
+                                if 0 < val < 10000:
+                                    break                              
+                                # 若數值異常，等待 1 秒後重試
+                                self.log(f"Debug: Fan {fan_id} read {val}, retrying {attempt+1}/{retry_limit}...") 
+                                time.sleep(0.5)
+                            rpms.append(val)
                         avg_rpm = sum(rpms) / len(rpms) if rpms else 0
                         
-                        result_msg = f"Fan {fan_id} | Duty {duty} | Avg RPM: {avg_rpm:.1f} (Spec: {spec_min}-{spec_max})"
+                        result_msg = f"Fan {fan_id} | Duty {target_duty} | Avg RPM: {avg_rpm:.1f} (Spec: {spec_min}-{spec_max})"
                         self.log(result_msg)
                         
                         with open(log_file, "a") as f:
@@ -530,16 +645,16 @@ class ODM_RunIn_Project(BaseRunInApp):
                             f.write(f"    Raw Data: {rpms}\n")
 
                         if not (spec_min <= avg_rpm <= spec_max):
-                            fail_msg = f"FAIL: Fan {fan_id} Duty {duty} RPM {avg_rpm:.1f} Out of Spec [{spec_min}-{spec_max}]"
+                            fail_msg = f"FAIL: Fan {fan_id} Duty {target_duty} RPM {avg_rpm:.1f} Out of Spec"
                             all_failures.append(fail_msg)
                             with open(log_file, "a") as f: f.write(f"    [RESULT] FAIL\n")
                         else:
                             with open(log_file, "a") as f: f.write(f"    [RESULT] PASS\n")
-
+                except Exception as e:
+                    raise e
                 # C. 最終判斷
                 if all_failures:
                     raise Exception(" | ".join(all_failures))
-
             except Exception as e:
                 raise e
                 
@@ -552,6 +667,7 @@ class ODM_RunIn_Project(BaseRunInApp):
     def run_stress_test_common(self, test_name, furmark_cmd, prime95_cmd):
         self.log(f"[{test_name}] Stress Test Starting...")
         log_dir = r"C:\Diag\Thermal"
+        tool_path = os.path.join(self.base_dir, "RI", "DiagECtool.exe")  
         os.makedirs(log_dir, exist_ok=True)
         try:
             # 動態讀取對應的 Duration (例如 Test1_Duration 或 Test3_Duration)
@@ -572,6 +688,18 @@ class ODM_RunIn_Project(BaseRunInApp):
         else:
             self.log(f"[{test_name}] GPUMon Disabled.")
         try:
+            # 0. set fan mode
+
+            fan_mode = self.config['Block1_Thermal'].get('Fan_Mode', None)
+            if fan_mode and str(fan_mode).strip():
+                fan_mode = str(fan_mode).strip()
+                self.log(f"Set Fan Mode: {fan_mode}")
+                self.exec_cmd_wait(f"{tool_path} raw --cmd 0x20 --subcmd 0x01 --data 0x03", capture_log=True)
+                self.exec_cmd_wait(f"{tool_path} raw --cmd 0x20 --subcmd 0x06 --data 0x0{fan_mode}", capture_log=True)
+                for _ in range(10):
+                    self.check_stop()
+                    QApplication.processEvents()
+                    time.sleep(1)
             # --- 階段 A: 啟動壓力工具 (Staggered Start) ---          
             # 1. 啟動 Furmark (傳入的指令)
             self.log(f"Starting Furmark: {furmark_cmd}")
@@ -595,9 +723,13 @@ class ODM_RunIn_Project(BaseRunInApp):
 
             # 4. 啟動 PTAT
             ptat_dir = r"C:\Program Files\Intel Corporation\Intel(R)PTAT"
-            ptat_cmd = "PTAT.exe -start -w=cpu.json"
-            self.log(f"Starting PTAT: {ptat_cmd}")
-            p_ptat = subprocess.Popen(ptat_cmd, cwd=ptat_dir, shell=True)
+            if os.path.exists(ptat_dir):                    
+                ptat_cmd = "PTAT.exe -start -w=cpu.json"
+                self.log(f"Starting PTAT: {ptat_cmd}")
+                p_ptat = subprocess.Popen(ptat_cmd, cwd=ptat_dir, shell=True)
+            else:
+                self.log("PTAT not installed (dir not found)")
+                raise Exception("PTAT not installed")
 
             # 5. 等待 20 秒 (Fan/GPUMon 前置緩衝)
             self.log("Waiting 20s before starting Fan Monitor...")
@@ -638,8 +770,8 @@ class ODM_RunIn_Project(BaseRunInApp):
             # 1. 停 PTAT (並等待寫入)
             ptat_dir = r"C:\Program Files\Intel Corporation\Intel(R)PTAT"
             ptat_cmd = "PTAT.exe -stop"
-            p_ptat = subprocess.Popen(ptat_cmd, cwd=ptat_dir, shell=True)
             try:
+                p_ptat = subprocess.Popen(ptat_cmd, cwd=ptat_dir, shell=True)
                 p_ptat.wait(timeout=60)
             except:
                 pass            
@@ -659,11 +791,13 @@ class ODM_RunIn_Project(BaseRunInApp):
             self.ensure_process_killed("prime95.exe")
             # 殺 Furmark (注意: FurMark GUI 與 CLI 可能名稱不同，通殺)
             self.ensure_process_killed("FurMark_GUI.exe")
-            self.ensure_process_killed("furmark.exe")           
+            self.ensure_process_killed("furmark.exe")    
             # 釋放資源
             for i in range(10):
                 if i % 10 == 0: QApplication.processEvents()
                 time.sleep(1)  
+            self.log("Teardown: Set Fan Mode AUTO")
+            subprocess.run(f"{tool_path} fan --mode auto", shell=True)    
 
         # --- 階段 D: 結果驗證 ---
         self.log(f"=== Verifying {test_name} Results ===")
@@ -676,22 +810,42 @@ class ODM_RunIn_Project(BaseRunInApp):
             self.archive_fan_log(fan_log, f"Dual_Fan")
         try:
             # 讀取對應 Test1 或 Test3 的 Fan Spec
-            spec_min = int(self.config['Block1_Thermal'][f'{test_name}_Fan_Min'])
-            spec_max = int(self.config['Block1_Thermal'][f'{test_name}_Fan_Max'])
+            spec_f1_min = int(self.config['Block1_Thermal'][f'{test_name}_Fan1_Min'])
+            spec_f1_max = int(self.config['Block1_Thermal'][f'{test_name}_Fan1_Max'])
+            
+            spec_f2_min = int(self.config['Block1_Thermal'][f'{test_name}_Fan2_Min'])
+            spec_f2_max = int(self.config['Block1_Thermal'][f'{test_name}_Fan2_Max'])
             
             avg_fan1 = self.analyze_fan_log_average(fan_log, 1) 
-            avg_fan2 = self.analyze_fan_log_average(fan_log, 2) 
+            avg_fan2 = self.analyze_fan_log_average(fan_log, 2)
             
-            if not (spec_min <= avg_fan1 <= spec_max) or not (spec_min <= avg_fan2 <= spec_max):
-                msg = f"Fan RPM FAIL: Fan1={avg_fan1}, Fan2={avg_fan2} (Spec: {spec_min}-{spec_max})"
+            fan_failed = False
+            # --- 驗證 Fan 1 ---
+            if not (spec_f1_min <= avg_fan1 <= spec_f1_max):
+                msg = f"Fan1 RPM FAIL: {avg_fan1} (Spec: {spec_f1_min}-{spec_f1_max})"
                 self.log(msg)
                 all_failures.append(msg)
-            else:
-                self.log(f"Fan RPM PASS: {avg_fan1}, {avg_fan2}")           
+                fan_failed = True
+            
+            # --- 驗證 Fan 2 ---
+            if not (spec_f2_min <= avg_fan2 <= spec_f2_max):
+                msg = f"Fan2 RPM FAIL: {avg_fan2} (Spec: {spec_f2_min}-{spec_f2_max})"
+                self.log(msg)
+                all_failures.append(msg)
+                fan_failed = True
+            
+            # 若兩者都沒失敗才算 PASS
+            if not fan_failed:
+                self.log(f"Fan RPM PASS: Fan1={avg_fan1}, Fan2={avg_fan2}")    
+
+        except KeyError as k:
+            all_failures.append(f"Config Key Missing: {k}")       
         except Exception as e:
             all_failures.append(f"Fan Check Error: {e}")
 
         # 2. 備份與檢查 PTAT Log
+        ptat_power_avg_val = 0
+        gpumon_power_avg_val = 0
         user_home = os.path.expanduser("~")
         ptat_log_dir = os.path.join(user_home, "Documents", "iPTAT", "log")           
         ptat_log = self.find_latest_log(ptat_log_dir, prefix="PTATMonitor")
@@ -707,6 +861,7 @@ class ODM_RunIn_Project(BaseRunInApp):
                 shutil.copy2(ptat_log, dest_path)
                 # 傳入 test_mode=test_name，這樣就會去讀 Test3_Low/High
                 ptat_errors = self.check_ptat_metrics(dest_path, test_mode=test_name) 
+                ptat_power_avg_val = self.get_ptat_avg_power_value(dest_path, test_mode=test_name)
                 if ptat_errors:
                     all_failures.extend(ptat_errors)
                 else:
@@ -729,6 +884,7 @@ class ODM_RunIn_Project(BaseRunInApp):
                     shutil.copy2(src_gpu_log, dest_gpu_path)
                     # 傳入 test_mode=test_name
                     gpu_errors = self.check_gpumon_metrics(dest_gpu_path, test_mode=test_name)
+                    gpumon_power_avg_val = self.get_gpumon_power_avg(dest_gpu_path, test_mode=test_name)
                     if gpu_errors:
                         all_failures.extend(gpu_errors)
                     else:
@@ -738,13 +894,76 @@ class ODM_RunIn_Project(BaseRunInApp):
             else:
                 self.log("WARNING: GPUMon Log missing!")
                 all_failures.append("GPUMon Log missing")
+                
+        # ==========================================
+        # 4. 總功耗檢查 (Total Power Check)
+        # ==========================================
+        total_pwr = ptat_power_avg_val + gpumon_power_avg_val
+        self.log(f"[Power Check] CPU: {ptat_power_avg_val:.2f}W + GPU: {gpumon_power_avg_val:.2f}W = Total: {total_pwr:.2f}W")
 
+        try:
+            # 從 Config 讀取 Total Power Spec
+            # 格式: Test1_TotalPower_Min / Max
+            spec_min = float(self.config['Block1_Thermal'].get(f'{test_name}_TotalPower_Min', 0))
+            spec_max = float(self.config['Block1_Thermal'].get(f'{test_name}_TotalPower_Max', 9999))
+            
+            if not (spec_min <= total_pwr <= spec_max):
+                msg = f"Total Power FAIL: {total_pwr:.2f}W (Spec: {spec_min}~{spec_max})"
+                self.log(msg)
+                all_failures.append(msg)
+            else:
+                self.log(f"Total Power PASS")
+                
+        except ValueError:
+            self.log("Warning: Invalid Total Power Spec in Config (Check format).")
+        except Exception as e:
+            all_failures.append(f"Total Power Check Error: {e}")
         # 最終判定
         if all_failures:
             error_summary = " | ".join(all_failures)
             raise Exception(f"{test_name} FAILED: {error_summary}")
         
         self.log(f"{test_name} ALL PASS.")
+    
+    # ==========================================
+    # 電量檢查
+    # ==========================================
+    def check_battery_threshold(self):
+        try:
+            threshold = int(self.config['Block1_Thermal']['Start_Battery_Threshold'])
+        except KeyError:
+            threshold = 90 # 預設值
+
+        self.log(f"Waiting for Battery > {threshold}%...")          
+        
+        while True:
+            # 檢查是否有人按 STOP
+            self.check_stop()
+            QApplication.processEvents() 
+            
+            try:
+                bat = psutil.sensors_battery()
+                if bat:
+                    current_pct = bat.percent
+                    is_plugged = bat.power_plugged
+                    status_str = "Charging" if is_plugged else "Discharging"
+                    
+                    self.log(f"Battery Status: {current_pct}% ({status_str}) / Target: {threshold}%")
+
+                    if current_pct >= threshold:
+                        self.log("Battery Threshold Reached!")
+                        break
+                    
+                    if not is_plugged:
+                        self.log("WARNING: AC Adapter not plugged in!")
+                else:
+                    self.log("No battery detected. Skipping check.")
+                    break
+            except Exception as e:
+                self.log(f"Error reading battery: {e}")
+            
+            # 等待 5 秒再檢查
+            time.sleep(5)
     # ==========================================
     # Block 1 實作 (Thermal)
     # ==========================================
@@ -754,40 +973,20 @@ class ODM_RunIn_Project(BaseRunInApp):
         os.makedirs(log_dir, exist_ok=True)
         
         # Step 0: 電量檢查
+        tool_path = os.path.join(self.base_dir, "RI", "DiagECtool.exe")
+        self.exec_cmd_wait(f"{tool_path} battery --mode auto", capture_log=True)
+        for i in range(5):
+            if i % 10 == 0: QApplication.processEvents()
+            time.sleep(1)
         if start_from_step == 0:
-            threshold = int(self.config['Block1_Thermal']['Start_Battery_Threshold'])
-            self.log(f"Step 0: Waiting for Battery > {threshold}%...")          
-            while True:
-                # [安全修正] 檢查停止訊號
-                self.check_stop()
-                QApplication.processEvents() 
-                try:
-                    bat = psutil.sensors_battery()
-                    if bat:
-                        current_pct = bat.percent
-                        is_plugged = bat.power_plugged
-                        status_str = "Charging" if is_plugged else "Discharging"
-                        self.log(f"Battery Status: {current_pct}% ({status_str}) / Target: {threshold}%")
-
-                        if current_pct >= threshold:
-                            self.log("Battery Threshold Reached!")
-                            break
-                        if not is_plugged:
-                            self.log("WARNING: AC Adapter not plugged in!")
-                    else:
-                        self.log("No battery detected. Skipping check.")
-                        break
-                except Exception as e:
-                    self.log(f"Error reading battery: {e}")
-                time.sleep(5)
-            
+            self.check_battery_threshold() 
             self.save_state("1", 1, current_cycle, status="IDLE")
-
         # ==========================================
         # [Test 1] Single Stress
         # ==========================================
         if start_from_step <= 1:
             self.log("[Test 1] Single Stress Start")
+            self.set_status(f"Cycle {current_cycle} | Running Test 1: Single Stress")
             cmd_prime95 = r".\RI\prime95\prime95.exe -t -small -A16"
             cmd_furmark = r"start .\RI\FurMark\FurMark_GUI.exe"
             try:
@@ -804,11 +1003,13 @@ class ODM_RunIn_Project(BaseRunInApp):
                 raise e
         # Step 2: Fan Max Speed
         if start_from_step <= 2:
-            self.log("Sleep 3min before Fan test...")         
+            self.log("Sleep 3min before Fan test...")   
+            self.set_status(f"Cycle {current_cycle} | Running Test 2: Fan Speed Test")      
             for i in range(180):
                 if i % 10 == 0: QApplication.processEvents()
                 time.sleep(1)
-            self.log("[Test 2] Fan Speed Test Start")         
+            self.log("[Test 2] Fan Speed Test Start")   
+            self.log(f"Battery percentage:{psutil.sensors_battery().percent}")     
             try:
                 # 呼叫剛剛寫好的 Helper 函式
                 self.run_fan_curve_test()
@@ -827,10 +1028,12 @@ class ODM_RunIn_Project(BaseRunInApp):
                 raise e           
         # Step 3: Dual Stress
         if start_from_step <= 3:
-            self.log("Sleep 3min before Dual burn test...")         
+            self.log("Sleep 3min before Dual burn test...")    
+            self.set_status(f"Cycle {current_cycle} | Running Test 3: Dual Stress")     
             for i in range(180):
                 if i % 10 == 0: QApplication.processEvents()
                 time.sleep(1)
+            self.check_battery_threshold() 
             self.log("[Test 3] Dual Stress Test")
             cmd_prime95 = r".\RI\prime95\prime95.exe -t -small -A16"
             cmd_furmark = r".\RI\FurMark\furmark.exe --demo furmark-gl --benchmark --max-time 1390 --no-score-box"
@@ -861,27 +1064,67 @@ class ODM_RunIn_Project(BaseRunInApp):
     # ==========================================
     def run_block_2(self, start_from_step=0, current_cycle=1):
         self.log("--- Block 2: Aging Test ---")
-        items = [(r"call .\RI\BatteryInfo.bat", False, False),
-                 (r"call .\RI\Battery.bat", False, True),
-                 (r"call .\RI\TurnOnOff.bat", False, True),
-                 (r"call .\RI\RICamera.bat", False, True),
-                 # (r"call .\RI\ColdBoot.bat", True, True),
-                 (r"call .\RI\RTC.bat", False, True),
-                 (r"call .\RI\Memory.bat", False, True),
-                 (r"call .\RI\HDD_CMD.bat", False, True),
-                 (r"call .\RI\3DMark.bat", False, True),
-                 (r"call .\RI\SetFanSpeed.bat", False, True),
-                 (r"call .\RI\S3sleeptest.bat", True, True),
-                 (r"call .\RI\S4sleeptest.bat", True, True),
-                 (r"call .\RI\CheckDriver.bat", False, True),
-                 (r"call .\RI\BTWIFI.bat", False, True)]
+        items = []
+        # 1. 嘗試從 Config 讀取測試項目
+        if 'Block2_Aging_Items' in self.config:
+            self.log("Loading Aging Items from Config...")
+            section = self.config['Block2_Aging_Items']
+            idx = 1
+            while True:
+                key = f"Item_{idx}"
+                if key not in section:
+                    break
+                
+                try:
+                    # 格式: Name | Command | Interrupt(1/0) | CaptureLog(1/0)
+                    raw_val = section[key]
+                    parts = [p.strip() for p in raw_val.split('|')]
+                    
+                    if len(parts) >= 4:
+                        name = parts[0]
+                        cmd = parts[1]
+                        will_interrupt = (parts[2] == '1')
+                        capture_log = (parts[3] == '1')
+                        items.append((name, cmd, will_interrupt, capture_log))
+                    else:
+                        self.log(f"Warning: Invalid format in {key}, skipping.")
+                except Exception as e:
+                    self.log(f"Error parsing {key}: {e}")
+                
+                idx += 1
+
+        if not items:
+            self.log("Config [Block2_Aging_Items] not found or empty. Using default list.")
+            items = [
+                ("Battery Info",   r"call .\RI\BatteryInfo.bat", False, False),
+                ("Battery Aging",  r"call .\RI\Battery.bat",     False, True),
+                ("Screen On/Off",  r"call .\RI\TurnOnOff.bat",   False, True),
+                ("Camera Test",    r"call .\RI\RICamera.bat",    False, True),
+                ("Cold Boot",      r"call .\RI\ColdBoot.bat",    True,  True),
+                ("RTC Check",      r"call .\RI\RTC.bat",         False, True),
+                ("Memory Stress",  r"call .\RI\Memory.bat",      False, False),
+                ("Storage Test",   r"call .\RI\HDD_CMD.bat",     False, True),
+                ("3DMark Test",    r"call .\RI\3DMark.bat",      False, True),
+                ("Fan Speed Set",  r"call .\RI\SetFanSpeed.bat", False, True),
+                ("S3 Sleep Test",  r"call .\RI\S3sleeptest.bat", True,  True),
+                ("S4 Sleep Test",  r"call .\RI\S4sleeptest.bat", True,  True),
+                ("Driver Check",   r"call .\RI\CheckDriver.bat", False, True),
+                ("BT/WiFi Test",   r"call .\RI\BTWIFI.bat",      False, True)
+            ]
         
-        for idx, (cmd, will_interrupt, capture_log) in enumerate(items):
-            if idx < start_from_step: continue
-            
+        for idx, (test_name, cmd, will_interrupt, capture_log) in enumerate(items):
+            if idx < start_from_step: continue           
+            # 更新 UI 狀態
+            self.set_status(f"Cycle {current_cycle} | Aging Step {idx+1}/{len(items)}: {test_name}")
+            self.log(f"Starting {test_name}...")
+            self.log(f"Battery percentage:{psutil.sensors_battery().percent}")
             # S3/S4 特殊處理 (Save RUNNING)
-            if "sleeptest" in cmd: 
-                self.save_state("2", idx, current_cycle, status="RUNNING")
+            if "sleeptest" in cmd.lower() or "coldboot" in cmd.lower(): 
+                if "coldboot" in cmd.lower():
+                    self.save_state("2", idx, current_cycle, status="REBOOTING")
+                    self.set_run_once_startup()
+                else:
+                    self.save_state("2", idx, current_cycle, status="RUNNING")
                 self.exec_cmd_wait(cmd, capture_log=capture_log)
                 self.save_state("2", idx + 1, current_cycle, status="IDLE")
                 continue
@@ -898,12 +1141,37 @@ class ODM_RunIn_Project(BaseRunInApp):
     # ==========================================
     # Block 3 實作 (Battery)
     # ==========================================
-    def run_block_3(self):
-        self.log("--- Block 3: Battery Charge/Discharge ---")
-        self.exec_cmd_wait(r"call .\RI\BatteryControl.bat")
-        
+    def run_block_3(self, current_cycle=1):
+        try:
+            tool_path = os.path.join(self.base_dir, "RI", "DiagECtool.exe") 
+            self.log("--- Block 3: Battery Charge/Discharge ---")
+            self.set_status(f"Cycle {current_cycle} | Running Block 3: Battery Charge/Discharge") 
+            self.log(f"Battery percentage:{psutil.sensors_battery().percent}")
+            self.save_state("3", 0, current_cycle, status="RUNNING")
+            self.exec_cmd_wait(r"call .\RI\BatteryControl.bat")
+        except Exception as e:
+            self.log(f"Error : {e}")
+        finally:
+            self.exec_cmd_wait(f"{tool_path} battery --mode auto", capture_log=True)
 if __name__ == "__main__":
-    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            # 6 = SW_MINIMIZE (縮小到工作列)
+            # 0 = SW_HIDE (完全隱藏, 若需要完全隱藏可改用 0)
+            ctypes.windll.user32.ShowWindow(hwnd, 6)
+    except Exception as e:
+        print(f"Failed to minimize console: {e}")
+
+    if getattr(sys, 'frozen', False):
+        # 如果是打包後的 exe，路徑要抓執行檔本身的位置
+        application_path = os.path.dirname(sys.executable)
+    else:
+        # 如果是跑 .py script
+        application_path = os.path.dirname(os.path.abspath(__file__))  
+
+    os.chdir(application_path)
+    print(f"Current Working Directory: {os.getcwd()}")
     os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
