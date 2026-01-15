@@ -34,6 +34,7 @@ class RunInWorker(QThread):
 
 class BaseRunInApp(QMainWindow):
     sig_update_ui_log = pyqtSignal(str)
+    sig_update_status = pyqtSignal(str)
 
     def __init__(self, title="ACER Run-In Test"):
         super().__init__()
@@ -43,13 +44,19 @@ class BaseRunInApp(QMainWindow):
         # --- 變數初始化 ---
         self.current_proc = None 
         self.stop_flag = False
+        self.is_rebooting = False
         
+        if getattr(sys, 'frozen', False):
+            # 打包後：抓 .exe 的位置
+            self.base_dir = os.path.dirname(sys.executable)
+        else:
+            # 開發時：抓 .py 的位置
+            self.base_dir = os.path.dirname(os.path.abspath(__file__))
         # --- 路徑與資料夾設定 ---
-        self.base_dir = os.path.dirname(os.path.abspath(__file__))
         self.state_file = os.path.join(self.base_dir, "runin_state.json")
         self.log_dir = os.path.join(self.base_dir, "log")
         
-        # [新增] Result 資料夾設定
+        # Result 資料夾設定
         self.result_dir = os.path.join(self.base_dir, "Result")
         
         # 確保資料夾存在
@@ -62,15 +69,31 @@ class BaseRunInApp(QMainWindow):
 
         # UI 初始化
         self.sig_update_ui_log.connect(self.append_log_text)
-        
+        # 連接狀態訊號到更新函式
+        self.sig_update_status.connect(self.update_status_label)
+
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
         
+        # 建立一個醒目的狀態標籤 (Status Label)
+        self.lbl_status = QLabel("READY")
+        self.lbl_status.setFixedHeight(60) # 設定高度
+        self.lbl_status.setAlignment(Qt.AlignCenter) # 文字置中
+        # 設定樣式: 深灰底、黃字、大字體、粗體
+        self.lbl_status.setStyleSheet("""
+            background-color: #333333; 
+            color: #FFD700; 
+            font-size: 24px; 
+            font-weight: bold; 
+            border: 2px solid #555;
+            border-radius: 5px;
+        """)
         # Log 區域
         self.txt_log = QTextEdit()
         self.txt_log.setReadOnly(True)
-        self.txt_log.setStyleSheet("background: black; color: #00FF00; font-family: Consolas;")
+        self.txt_log.setStyleSheet("background: black; color: #00FF00; font-family: Consolas; font-size: 15pt;")
+        
         
         # 按鈕區域
         btn_layout = QHBoxLayout()
@@ -88,6 +111,7 @@ class BaseRunInApp(QMainWindow):
         btn_layout.addWidget(self.btn_stop)
         
         main_layout.addWidget(QLabel(title))
+        main_layout.addWidget(self.lbl_status)
         main_layout.addWidget(self.txt_log)
         main_layout.addLayout(btn_layout)
 
@@ -106,6 +130,11 @@ class BaseRunInApp(QMainWindow):
             self.start_test(is_resume=True)
 
     def check_previous_log(self):
+        # 如果狀態檔存在，代表這是同一次測試的延續，不應該切分 Log
+        if os.path.exists(self.state_file):
+            self.log(">>> Detected Resume State. Continuing with existing log. <<<")
+            return
+        # 如果沒有狀態檔，但 Log 卻存在，才視為上次的殘留檔進行封存
         if os.path.exists(self.current_log_file):
             try:
                 timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -113,11 +142,10 @@ class BaseRunInApp(QMainWindow):
                     f.write(f"[{timestamp}] !!! DETECTED NEW STARTUP WHILE LOG EXISTS (PREVIOUS CRASH?) !!!\n")
             except:
                 pass
-            self.log("Found unfinished log. Archiving as Crash...")
+            self.log("Found old log from previous run. Archiving...")
             self.archive_log(prefix="Runin_Debug_Crash_")
 
     def start_test(self, is_resume=False):
-        # [新增] 每次開始前，清除上次的結果檔
         self.cleanup_results()
 
         self.stop_flag = False
@@ -138,6 +166,10 @@ class BaseRunInApp(QMainWindow):
         
         self.btn_stop.setEnabled(False)
         self.btn_start.setEnabled(False)
+        
+        tool_path = os.path.join(self.base_dir, "RI", "DiagECtool.exe") 
+        self.exec_cmd_wait(f"{tool_path} battery --mode auto", capture_log=True)
+        self.exec_cmd_wait(f"{tool_path} fan --mode auto", capture_log=True)
         
         if self.current_proc:
             try:
@@ -174,25 +206,29 @@ class BaseRunInApp(QMainWindow):
     def exec_cmd_wait(self, cmd, timeout=None, capture_log=True):
         self.check_stop()
         
-        # 根據是否抓 Log 來決定提示訊息
+        popen_kwargs = {
+            'shell': True
+        }
         if capture_log:
             self.log(f"CMD > {cmd}")
-            # 使用 PIPE 抓取輸出 (原本的邏輯)
-            self.current_proc = subprocess.Popen(
-                cmd, 
-                shell=True, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.STDOUT
-            )
+            # 只有要抓 Log 時才使用 PIPE
+            popen_kwargs['stdout'] = subprocess.PIPE
+            popen_kwargs['stderr'] = subprocess.STDOUT
         else:
-            self.log(f"CMD > {cmd} (Log Capture Disabled)")
-            # [修正點] 不使用 PIPE，直接繼承 Console，避免 FDPCMD 崩潰
-            self.current_proc = subprocess.Popen(cmd, shell=True)
+            self.log(f"CMD > {cmd} (Log Capture Disabled - Independent Console)")
+            # 針對不抓 Log 的指令 (通常是 legacy tool 如 FDPCMD)
+            # 強制開啟一個全新的 Console 視窗，避開 PyInstaller 無視窗環境的限制
+            popen_kwargs['creationflags'] = subprocess.CREATE_NEW_CONSOLE
 
+        self.current_proc = subprocess.Popen(cmd, **popen_kwargs)
+        ret = -1
         try:
             if capture_log:
                 # 有抓 Log 才需要讀取迴圈
                 while True:
+                    if self.stop_flag:
+                        self.current_proc.terminate()
+                        break
                     output_bytes = self.current_proc.stdout.readline()
                     if not output_bytes and self.current_proc.poll() is not None:
                         break
@@ -207,7 +243,15 @@ class BaseRunInApp(QMainWindow):
             # 等待結束
             ret = self.current_proc.wait(timeout=timeout)
             
+        except subprocess.TimeoutExpired:
+            self.log(f"Command Timeout ({timeout}s): {cmd}")
+            if self.current_proc:
+                self.current_proc.kill()
+            raise Exception(f"Command Timeout: {cmd}")           
         except Exception as e:
+            self.log(f"Command Exception: {e}")
+            if self.current_proc:
+                self.current_proc.kill()
             raise e
         finally:
             self.current_proc = None
@@ -219,6 +263,31 @@ class BaseRunInApp(QMainWindow):
         
         self.log("CMD < PASS")
 
+    def run_external_tool_standalone(self, cmd_str):
+        """
+        專門用來執行像 FDPCMD 這種會搶 Console 的工具。
+        它會彈出一個獨立的黑視窗執行，執行完後關閉。
+        回傳: return code (0=Pass, 非0=Fail)
+        """
+        import subprocess
+        
+        self.log(f"Running standalone command: {cmd_str}")
+        
+        try:
+            # CREATE_NEW_CONSOLE (0x00000010) 讓它擁有獨立視窗
+            # 這樣 FDPCMD 就會像您手動執行一樣快樂
+            creation_flags = subprocess.CREATE_NEW_CONSOLE
+            
+            # 使用 call 等待它執行完畢
+            # 這裡我們不接管 stdout/stderr，直接讓它顯示在新視窗
+            ret_code = subprocess.call(cmd_str, creationflags=creation_flags, shell=True)
+            
+            return ret_code
+            
+        except Exception as e:
+            self.log(f"Error running standalone tool: {e}")
+            return -1
+        
     def save_state(self, block, step, cycle=1, status="IDLE"):
         state = {"block": block, "step": step, "cycle": cycle, "status": status}
         with open(self.state_file, "w") as f: json.dump(state, f)
@@ -234,54 +303,98 @@ class BaseRunInApp(QMainWindow):
     def trigger_reboot(self):
         try:
             self.check_stop()
-            
+            self.is_rebooting = True
+
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\RunOnce", 0, winreg.KEY_WRITE)
             cmd = f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}"'
             winreg.SetValueEx(key, "ODM_RunIn", 0, winreg.REG_SZ, cmd)
             winreg.CloseKey(key)
             
             self.log("Reboot triggered. Shutting down...")
-            self.archive_log(prefix="Runin_Debug_Reboot_")
+            # self.archive_log(prefix="Runin_Debug_Reboot_")  <-- 註解掉或刪除這行
             
             subprocess.run("shutdown /r /t 0 /f", shell=True)
             while True: time.sleep(1)
         except Exception as e:
+            self.is_rebooting = False
             self.log(f"Reboot Failed: {e}")
             raise e
+        
+    def set_run_once_startup(self):
+        """將目前的程式註冊到 Windows RunOnce，下次開機自動執行一次"""
+        try:
+            # 1. 取得目前執行檔的路徑
+            if getattr(sys, 'frozen', False):
+                # PyInstaller 打包後：抓 .exe 完整路徑
+                exe_path = sys.executable
+                self.log(f"set_run_once_startup {exe_path}")
+            else:
+                exe_path = f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}"'
+                self.log("Dev mode: Skipping RunOnce registration (Run packaged EXE to test reboot)")
+                return
+
+            # 2. 開啟登錄檔路徑
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\RunOnce",
+                0, 
+                winreg.KEY_SET_VALUE
+            )
+            
+            # 3. 寫入數值 (Name: ODM_RunIn, Value: "C:\Path\To\ODM_RunIn.exe")
+            # 建議加上引號，避免路徑有空白出錯
+            winreg.SetValueEx(key, "ODM_RunIn", 0, winreg.REG_SZ, f'"{exe_path}"')
+            winreg.CloseKey(key)
+            
+            self.log(f"RunOnce Registered: {exe_path}")
+            
+        except Exception as e:
+            self.log(f"Failed to set startup: {e}")
 
     def on_finished(self, passed):
         # 決定最終結果：必須是 passed 為 True 且沒有被 STOP
         final_result = passed and not self.stop_flag
-
+        tool_path = os.path.join(self.base_dir, "RI", "DiagECtool.exe") 
+        self.exec_cmd_wait(f"{tool_path} battery --mode auto", capture_log=True)
+        self.exec_cmd_wait(f"{tool_path} fan --mode auto", capture_log=True)
         if self.stop_flag:
             self.log("=== TEST STOPPED BY USER (Please Restart Application) ===")
+            self.set_status("TEST STOPPED")
             self.btn_start.setText("STOPPED")
             self.btn_start.setEnabled(False)
             self.btn_stop.setEnabled(False)
             self.clear_state()
         else:
             self.btn_start.setEnabled(False)
-            self.btn_start.setText("FINISHED")
+            #self.btn_start.setText("FINISHED")
             self.btn_stop.setEnabled(False)
             
             if final_result:
+                self.btn_start.setText("PASS")
+                self.set_status("ALL PASS")
+                self.btn_start.setStyleSheet("background-color: #00C853; color: white; font-weight: bold; font-size: 36px;")
                 self.log("=== TEST FINISHED: PASS ===")
                 self.clear_state()
             else:
+                self.btn_start.setText("FAIL")
+                self.set_status("TEST FAILED")
+                self.btn_start.setStyleSheet("background-color: #D50000; color: white; font-weight: bold; font-size: 36px;")
                 self.log("=== TEST STOPPED: FAIL ===")
         
         # [新增] 產生結果檔
-        self.generate_result_file(final_result)
-        
+        self.generate_result_file(final_result)     
         self.archive_log()
 
     def closeEvent(self, event):
+        if self.is_rebooting:
+            event.accept()
+            return
+        
         if os.path.exists(self.current_log_file):
             self.log("User closed the application (Manual Abort).")
             if self.current_proc and self.current_proc.poll() is None:
                  subprocess.run(f"taskkill /F /T /PID {self.current_proc.pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
-            # [新增] 如果還在跑的時候關閉，視為 FAIL
             # 判斷依據：如果 START 按鈕是 Disabled (且不是 STOPPED 狀態)，代表正在跑
             if not self.btn_start.isEnabled() and self.btn_start.text() == "RUNNING...":
                 self.generate_result_file(False)
@@ -328,3 +441,10 @@ class BaseRunInApp(QMainWindow):
             self.log(f">>> Result Generated: {filename} <<<")
         except Exception as e:
             self.log(f"Failed to generate result file: {e}")
+    
+    def set_status(self, text):
+        # 透過 emit 發送訊號，確保在主執行緒更新 UI (Thread-Safe)
+        self.sig_update_status.emit(text)
+
+    def update_status_label(self, text):
+        self.lbl_status.setText(text)
