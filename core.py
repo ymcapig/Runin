@@ -15,7 +15,7 @@ from PyQt5.QtCore import QThread, pyqtSignal, Qt
 
 class RunInWorker(QThread):
     sig_log = pyqtSignal(str)
-    sig_finished = pyqtSignal(bool) # True=PASS, False=FAIL
+    sig_finished = pyqtSignal(bool, str) # True=PASS, False=FAIL
 
     def __init__(self, logic_func):
         super().__init__()
@@ -26,11 +26,12 @@ class RunInWorker(QThread):
             # 執行主流程
             self.logic_func()
             # 若無錯誤跑完，視為 PASS
-            self.sig_finished.emit(True)
+            self.sig_finished.emit(True, "All Tests Passed")
         except Exception as e:
             # 只要有 Exception (包含 exec_cmd_wait 拋出的)，就視為 FAIL 並停止
-            self.sig_log.emit(f"!!! STOPPED: {str(e)} !!!")
-            self.sig_finished.emit(False)
+            err_msg = str(e)
+            self.sig_log.emit(f"!!! STOPPED: {err_msg} !!!")
+            self.sig_finished.emit(False, err_msg)
 
 class BaseRunInApp(QMainWindow):
     sig_update_ui_log = pyqtSignal(str)
@@ -355,7 +356,7 @@ class BaseRunInApp(QMainWindow):
         except Exception as e:
             self.log(f"Failed to set startup: {e}")
 
-    def on_finished(self, passed):
+    def on_finished(self, passed, msg=""):
         # 決定最終結果：必須是 passed 為 True 且沒有被 STOP
         final_result = passed and not self.stop_flag
 
@@ -382,13 +383,16 @@ class BaseRunInApp(QMainWindow):
             if final_result:
                 self.btn_start.setText("PASS")
                 self.set_status("ALL PASS")
-                self.btn_start.setStyleSheet("background-color: #00C853; color: white; font-weight: bold; font-size: 36px;")
+                self.btn_start.setStyleSheet("background-color: #00C853; color: white; font-weight: bold; font-size: 72px;")
                 self.log("=== TEST FINISHED: PASS ===")
                 self.clear_state()
             else:
                 self.btn_start.setText("FAIL")
                 self.set_status("TEST FAILED")
-                self.btn_start.setStyleSheet("background-color: #D50000; color: white; font-weight: bold; font-size: 36px;")
+                self.btn_start.setStyleSheet("background-color: #D50000; color: white; font-weight: bold; font-size: 72px;")
+                self.txt_log.append("<br><hr>")
+                self.txt_log.append(f"<h1 style='color: red; background-color: #ffe6e6;'>!!! FAIL REASON:</h1>")
+                self.txt_log.append(f"<h2 style='color: red;'>{msg}</h2>")
                 self.log("=== TEST STOPPED: FAIL ===")
         
         # 產生結果檔
@@ -400,23 +404,46 @@ class BaseRunInApp(QMainWindow):
             event.accept()
             return
         
+        if hasattr(self, 'fan_thread') and self.fan_thread is not None:
+            if self.fan_thread.isRunning():
+                self.log("Stopping fan monitor...")
+                self.fan_thread.stop() # FanMonitorThread 定義的 stop()
+                # Fan Thread 很快，通常不用太久的 wait，但為了保險可以 wait
+                self.fan_thread.wait(1000)
+
         # --- 安全停止 Worker ---
         if hasattr(self, 'worker') and self.worker.isRunning():
             self.log("Close event detected. Stopping worker thread...")
-            self.stop_flag = True  # 通知 Worker 停止
+            self.stop_flag = True  # 通知 Worker 停止           
             # 嘗試等待一下讓 Worker 收屍 (選用，避免卡住 UI 太久)
-            self.worker.wait(10000) 
-        # -----------------------------
-        
-        if os.path.exists(self.current_log_file):
-            self.log("User closed the application (Manual Abort).")
-            if self.current_proc and self.current_proc.poll() is None:
-                 subprocess.run(f"taskkill /F /T /PID {self.current_proc.pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
-            # 判斷依據：如果 START 按鈕是 Disabled (且不是 STOPPED 狀態)，代表正在跑
-            if not self.btn_start.isEnabled() and self.btn_start.text() == "RUNNING...":
-                self.generate_result_file(False)
+            max_wait_time = 60000 
+            start_time = time.time()
+            while self.worker.isRunning():
+                if self.worker.wait(100): 
+                    break # 如果 Worker 結束了就跳出
+                QApplication.processEvents()
+                if (time.time() - start_time) * 1000 > max_wait_time:
+                    self.log("Worker thread timeout (30s), forcing close.")
+                    break
+        # -----------------------------        
+        try:
+            self.log("Resetting hardware to Auto mode...")
+            # 假設 DiagECtool 在 .\RI\DiagECtool.exe
+            tool_exe = os.path.join(os.getcwd(), "RI", "DiagECtool.exe")            
+            subprocess.run(f"{tool_exe} battery --mode auto", shell=True, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.log("Resetting battery to Auto mode...")
+            subprocess.run(f"{tool_exe} fan --mode auto", shell=True, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.log("Resetting fan to Auto mode...")        
+        except Exception as e:
+            print(f"Hardware reset error: {e}")
+        # ----------------------------- 
+        if self.current_proc and self.current_proc.poll() is None:
+             subprocess.run(f"taskkill /F /T /PID {self.current_proc.pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # 判斷依據：如果 START 按鈕是 Disabled (且不是 STOPPED 狀態)，代表正在跑
+        if not self.btn_start.isEnabled() and self.btn_start.text() == "RUNNING...":
+            self.generate_result_file(False)
 
+        if os.path.exists(self.current_log_file):
             self.archive_log(prefix="Runin_Debug_UserAbort_")
         event.accept()
 
