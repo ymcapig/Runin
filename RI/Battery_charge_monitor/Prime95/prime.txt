@@ -1,0 +1,52 @@
+NumWorkers=1
+WorkPreference=0
+CoresPerTest=1
+ComputerGUID=f688d68853113b8afabac236fd05e79e
+StressTester=1
+UsePrimenet=0
+TortureHyperthreading=0
+MinTortureFFT=172
+MaxTortureFFT=245
+TortureMem=8
+TortureTime=3
+TortureWeak=1048576
+CPUHours=16
+CertWork=1
+ErrorCheck=1
+
+[Internals]
+OldCpuSpeed=4342
+NewCpuSpeedCount=5
+NewCpuSpeed=4152
+V30OptionsConverted=1
+WGUID_version=2
+RollingAverage=1000
+RollingStartTime=0
+
+[Windows]
+Left=906
+Top=626
+Right=2346
+Bottom=1494
+W1=0 0 1416 71 0 -1 -1 -11 -45
+W2=0 44 1416 115 0 -1 -1 -11 -45
+W3=0 88 1416 159 0 -1 -1 -1 -1
+W4=0 133 1416 204 0 -1 -1 -1 -1
+W5=0 177 1416 248 0 -1 -1 -1 -1
+W6=0 222 1416 293 0 -1 -1 -1 -1
+W7=0 266 1416 337 0 -1 -1 -11 -45
+W8=0 310 1416 381 0 -1 -1 -1 -1
+W9=0 355 1416 426 0 -1 -1 -1 -1
+W10=0 399 1416 470 0 -1 -1 -1 -1
+W11=0 444 1416 515 0 -1 -1 -1 -1
+W12=0 488 1416 559 0 -1 -1 -1 -1
+W13=0 532 1416 603 0 -1 -1 -1 -1
+W14=0 577 1416 633 0 -1 -1 -1 -1
+W15=0 621 1416 677 0 -1 -1 -1 -1
+W16=0 666 1416 722 0 -1 -1 -1 -1
+W17=0 710 1416 766 0 -1 -1 -1 -1
+MergeWindows=8
+
+[Prime95]
+Workrs=4
+Memory=8192
