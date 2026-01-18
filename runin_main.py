@@ -13,15 +13,133 @@ from core import BaseRunInApp
 from PyQt5.QtCore import Qt, QThread, QLockFile, QDir, QTimer
 
 # ==========================================
+# Helper: EC io txrx class
+# ==========================================
+class DirectEC:
+    def __init__(self, dll_folder):
+        # 設定 inpoutx64.dll 路徑
+        dll_path = os.path.join(dll_folder, "inpoutx64.dll")
+        if not os.path.exists(dll_path):
+            print(f"[DirectEC] Error: DLL not found at {dll_path}")
+            self.dll = None
+            return
+
+        try:
+            self.dll = ctypes.WinDLL(dll_path)
+            self.cmd_port = 0x6C
+            self.dat_port = 0x68
+            self.initialized = True
+            print("[DirectEC] DLL Loaded successfully.")
+        except Exception as e:
+            print(f"[DirectEC] Failed to load DLL: {e}")
+            self.dll = None
+            self.initialized = False
+
+    def wait_ibf_clear(self, timeout_s=0.5):
+        """等待 Input Buffer Full 清除"""
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < timeout_s:
+            if (self.dll.Inp32(self.cmd_port) & 0x02) == 0:
+                return True
+            time.sleep(0.001)
+        return False
+
+    def wait_obf_set(self, timeout_s=0.5):
+        """等待 Output Buffer Full 設定 (有資料可讀)"""
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < timeout_s:
+            if (self.dll.Inp32(self.cmd_port) & 0x01) != 0:
+                return True
+            time.sleep(0.001)
+        return False
+
+    def txrx(self, cmd, data_payload, expect_len, wait_s=0.05):
+        if not self.initialized: return None
+
+        try:
+            # 1. Write Command
+            if not self.wait_ibf_clear(): return None
+            self.dll.Out32(self.cmd_port, cmd)
+            time.sleep(0.05) # 模擬 ecio 的 command delay
+
+            # 2. Write Payload
+            for d in data_payload:
+                if not self.wait_ibf_clear(): return None
+                self.dll.Out32(self.dat_port, d)
+                time.sleep(0.005) # 模擬 ecio 的 data delay
+
+            # 3. Read Response
+            resp = []
+            for _ in range(expect_len):
+                if self.wait_obf_set(timeout_s=wait_s):
+                    val = self.dll.Inp32(self.dat_port) & 0xFF
+                    resp.append(val)
+                else:
+                    break # Timeout or no more data
+            
+            return resp
+        except Exception as e:
+            print(f"[DirectEC] txrx error: {e}")
+            return None
+    def get_fan_rpm(self, fan_id):
+        # CMD=0x20, SubCmd=0x05, Payload=[0x05, FanID]
+        # 回傳: [LowByte, HighByte]
+        if not self.initialized: return 0
+        
+        CMD = 0x20
+        payload = [0x05, fan_id]
+        
+        # 嘗試 3 次 (如原始碼)
+        for _ in range(3):
+            resp = self.txrx(CMD, payload, expect_len=2, wait_s=0.05)
+            if resp and len(resp) == 2:
+                rpm = resp[0] | (resp[1] << 8)
+                return rpm
+        return 0
+
+    def get_ts2_temp(self):
+        # CMD=0x28, TS2_SubCmd=0x05
+        # 回傳: [Temp]
+        if not self.initialized: return 0
+        
+        CMD = 0x28
+        payload = [0x05] # 0x05 對應 thermaltest.py 中的 "ts2"
+        
+        for _ in range(3):
+            resp = self.txrx(CMD, payload, expect_len=1, wait_s=0.05)
+            if resp and len(resp) == 1:
+                return resp[0]
+        return 0
+    
+    def get_charging_current(self):
+        if not self.initialized: return 0
+        
+        CMD = 0x31
+        payload = [0x0C]
+        
+        for _ in range(3):
+            resp = self.txrx(CMD, payload, expect_len=2, wait_s=0.1)
+            if resp and len(resp) == 2:
+                chg_current = resp[0] | (resp[1] << 8)
+                return chg_current
+        return 0
+        
+# ==========================================
 # Helper: 風扇監控執行緒 (背景執行)
 # ==========================================
 class FanMonitorThread(QThread):
-    def __init__(self, csv_path, interval=5):
+    def __init__(self, csv_path, interval=1):
         super().__init__()
         self.csv_path = csv_path
         self.interval = interval
         self.running = True
 
+        if getattr(sys, 'frozen', False):
+            self.base_dir = os.path.dirname(sys.executable)
+        else:
+            self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        ri_folder = os.path.join(self.base_dir, "RI")
+        self.ec = DirectEC(ri_folder)
     def run(self):
         # 確保目錄存在
         os.makedirs(os.path.dirname(self.csv_path), exist_ok=True)
@@ -29,24 +147,27 @@ class FanMonitorThread(QThread):
         # 寫入 CSV Header
         with open(self.csv_path, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(["Timestamp", "Fan1_RPM", "Fan2_RPM", "ts2"])
+            writer.writerow(["Timestamp", "Fan1_RPM", "Fan2_RPM", "TS2"])
 
         while self.running:
+            start_time = time.time()
             try:
                 now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                rpm1 = self.get_rpm(1)
-                rpm2 = self.get_rpm(2)
-                ts2 = self.get_ts2()
+                rpm1 = self.ec.get_fan_rpm(1)
+                rpm2 = self.ec.get_fan_rpm(2)
+                ts2 = self.ec.get_ts2_temp()
                 with open(self.csv_path, 'a', newline='') as f:
                     writer = csv.writer(f)
                     writer.writerow([now, rpm1, rpm2, ts2])
+
+                self.update_signal.emit(rpm1, rpm2, ts2)
             except Exception as e:
                 pass 
 
-            # 間隔休息
-            for _ in range(self.interval):
-                if not self.running: break
-                self.msleep(1000)
+            #間隔休息
+            elapsed = time.time() - start_time
+            sleep_time = max(0.1, self.interval - elapsed)
+            time.sleep(sleep_time)
 
     def get_rpm(self, fan_id):
         try:
@@ -104,6 +225,8 @@ class ODM_RunIn_Project(BaseRunInApp):
             # 開發時：抓 .py 的位置
             self.base_dir = os.path.dirname(os.path.abspath(__file__))
         QTimer.singleShot(1000, self.check_auto_run)
+        ri_folder = os.path.join(self.base_dir, "RI")
+        self.ec = DirectEC(ri_folder)
 
     # Auto Run 檢查邏輯
     def check_auto_run(self):
@@ -251,18 +374,22 @@ class ODM_RunIn_Project(BaseRunInApp):
         
     def archive_fan_log(self, src_path, prefix_name):
         if not os.path.exists(src_path):
-            return
+            return None # 檔案不存在回傳 None
         try:
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
             new_filename = f"{timestamp}_{prefix_name}.csv"
-            # 假設 log_dir 在 run_block_1 已經定義，或直接存到 src_path 同目錄
             dest_dir = os.path.dirname(src_path)
             dest_path = os.path.join(dest_dir, new_filename)
             
-            shutil.copy2(src_path, dest_path)
-            self.log(f"Fan Log archived: {new_filename}")
+            # 使用 move 取代 copy2，這樣原檔就會被刪除 (移動)
+            shutil.move(src_path, dest_path)
+            
+            self.log(f"Fan Log archived (moved): {new_filename}")
+            return dest_path # [新增] 回傳新路徑供分析使用
+            
         except Exception as e:
             self.log(f"Error archiving fan log: {e}")
+            return None
 
     def analyze_ptat_log(self, csv_path, col_idx, duration_sec=120):
             """ 
@@ -352,6 +479,7 @@ class ODM_RunIn_Project(BaseRunInApp):
     def check_ptat_metrics(self, csv_path, test_mode="Test1"):
         self.log(f"Verifying PTAT Metrics in {os.path.basename(csv_path)}...")
         errors = []
+        detailed_data = []
         if not os.path.exists(csv_path): return ["PTAT Log not found"]
 
         # 1. 找出 Config 定義的 Keys
@@ -362,7 +490,7 @@ class ODM_RunIn_Project(BaseRunInApp):
         
         if not ptat_keys:
             self.log("No PTAT_Key defined in Config. Skipping check.")
-            return
+            return [], []
 
         # 2. 建立 Header Map
         header_map = {}
@@ -387,19 +515,29 @@ class ODM_RunIn_Project(BaseRunInApp):
                 
                 limit_low = float(self.config[target_col_name][cfg_low_key])
                 limit_high = float(self.config[target_col_name][cfg_high_key])
+                item_result = "PASS"
                 if avg_val < limit_low or avg_val > limit_high:
                     msg = f"{target_col_name} FAIL: {avg_val:.2f} (Spec: {limit_low}~{limit_high})"
                     self.log(msg)
                     errors.append(msg)
+                    item_result = "FAIL"
                 else:
                     self.log(f"PASS: {target_col_name} = {avg_val:.2f} (Spec: {limit_low}~{limit_high})")
+
+                detailed_data.append({
+                    "Item": target_col_name,
+                    "Value": f"{avg_val:.2f}",
+                    "Min": limit_low,
+                    "Max": limit_high,
+                    "Result": item_result
+                })
 
             except KeyError:
                 self.log(f"WARNING: Config key '{cfg_low_key}/{cfg_high_key}' missing for [{target_col_name}]")
             except ValueError:
                 self.log(f"WARNING: Invalid value for [{target_col_name}]")
         
-        return errors
+        return errors, detailed_data
 
     def get_ptat_avg_power_value(self, csv_path, test_mode="Test1"):
         self.log(f"Calculating PTAT Power Avg ({test_mode})...") # Log 可視需求開關        
@@ -479,13 +617,14 @@ class ODM_RunIn_Project(BaseRunInApp):
     def check_gpumon_metrics(self, csv_path, test_mode="Test1"):
         self.log(f"Verifying GPUMon Metrics ({test_mode})...")
         errors = []       
+        detailed_data = []
         # 1. 找出 Config Keys
         gpu_keys = []
         for key, value in self.config['Block1_Thermal'].items():
             if key.lower().startswith('gpumon_key_'):
                 gpu_keys.append(value)
         
-        if not gpu_keys: return []
+        if not gpu_keys: return [], []
         # 2. 建立 Header Map
         header_map = {}
         with open(csv_path, 'r') as f:
@@ -506,15 +645,25 @@ class ODM_RunIn_Project(BaseRunInApp):
                 limit_low = float(self.config[target_col][cfg_low])
                 limit_high = float(self.config[target_col][cfg_high])
                 
+                item_result = "PASS"
                 if avg_val < limit_low or avg_val > limit_high:
                     msg = f"GPUMon {target_col} FAIL: {avg_val:.2f} (Spec: {limit_low}~{limit_high})"
                     self.log(msg)
                     errors.append(msg)
+                    item_result = "FAIL"
                 else:
                     self.log(f"GPUMon PASS: {target_col} = {avg_val:.2f}")
+                
+                detailed_data.append({
+                    "Item": f"GPUMon_{target_col}",
+                    "Value": f"{avg_val:.2f}",
+                    "Min": limit_low,
+                    "Max": limit_high,
+                    "Result": item_result
+                })
             except Exception as e:
                 errors.append(f"GPUMon Config Error [{target_col}]: {e}")               
-        return errors
+        return errors, detailed_data
     
     def get_gpumon_power_avg(self, csv_path, test_mode="Test1"):
         # self.log(f"Calculating GPUMon Power Avg ({test_mode})...")
@@ -758,7 +907,7 @@ class ODM_RunIn_Project(BaseRunInApp):
 
             # 6. 啟動 Fan Monitor
             fan_thread = FanMonitorThread(fan_log)
-            fan_thread.start()
+            fan_thread.start(QThread.TimeCriticalPriority)
 
             # 7. 啟動 GPUMon (若啟用)
             if is_gpumon_enabled:
@@ -821,37 +970,52 @@ class ODM_RunIn_Project(BaseRunInApp):
         self.log(f"=== Verifying {test_name} Results ===")
         all_failures = []
         
+        summary_csv_data = []
         # 1. 備份與檢查 Fan Log
+        archived_fan_log = None
+
         if test_name == "Test1":
-            self.archive_fan_log(fan_log, f"CPU_only_Fan")
+            archived_fan_log = self.archive_fan_log(fan_log, f"CPU_only_Fan")
         else:
-            self.archive_fan_log(fan_log, f"Dual_Fan")
+            archived_fan_log = self.archive_fan_log(fan_log, f"Dual_Fan")
+        target_log_to_analyze = archived_fan_log if (archived_fan_log and os.path.exists(archived_fan_log)) else fan_log    
         try:
             # 讀取對應 Test1 或 Test3 的 Fan Spec
             spec_f1_min = int(self.config['Block1_Thermal'][f'{test_name}_Fan1_Min'])
-            spec_f1_max = int(self.config['Block1_Thermal'][f'{test_name}_Fan1_Max'])
-            
+            spec_f1_max = int(self.config['Block1_Thermal'][f'{test_name}_Fan1_Max'])       
             spec_f2_min = int(self.config['Block1_Thermal'][f'{test_name}_Fan2_Min'])
             spec_f2_max = int(self.config['Block1_Thermal'][f'{test_name}_Fan2_Max'])
             
-            avg_fan1 = self.analyze_fan_log_average(fan_log, 1) 
-            avg_fan2 = self.analyze_fan_log_average(fan_log, 2)
+            avg_fan1 = self.analyze_fan_log_average(target_log_to_analyze, 1) 
+            avg_fan2 = self.analyze_fan_log_average(target_log_to_analyze, 2)
             
             fan_failed = False
             # --- 驗證 Fan 1 ---
+            res_f1 = "PASS"
             if not (spec_f1_min <= avg_fan1 <= spec_f1_max):
                 msg = f"Fan1 RPM FAIL: {avg_fan1} (Spec: {spec_f1_min}-{spec_f1_max})"
                 self.log(msg)
                 all_failures.append(msg)
                 fan_failed = True
-            
+                res_f1 = "FAIL"
+
+            summary_csv_data.append({
+                "Item": "Fan1_RPM", "Value": avg_fan1, 
+                "Min": spec_f1_min, "Max": spec_f1_max, "Result": res_f1
+            })            
             # --- 驗證 Fan 2 ---
+            res_f2 = "PASS"
             if not (spec_f2_min <= avg_fan2 <= spec_f2_max):
                 msg = f"Fan2 RPM FAIL: {avg_fan2} (Spec: {spec_f2_min}-{spec_f2_max})"
                 self.log(msg)
                 all_failures.append(msg)
                 fan_failed = True
+                res_f2 = "FAIL"
             
+            summary_csv_data.append({
+                "Item": "Fan2_RPM", "Value": avg_fan2, 
+                "Min": spec_f2_min, "Max": spec_f2_max, "Result": res_f2
+            })
             # 若兩者都沒失敗才算 PASS
             if not fan_failed:
                 self.log(f"Fan RPM PASS: Fan1={avg_fan1}, Fan2={avg_fan2}")    
@@ -878,12 +1042,14 @@ class ODM_RunIn_Project(BaseRunInApp):
             try:
                 shutil.copy2(ptat_log, dest_path)
                 # 傳入 test_mode=test_name，這樣就會去讀 Test3_Low/High
-                ptat_errors = self.check_ptat_metrics(dest_path, test_mode=test_name) 
+                ptat_errors, ptat_data = self.check_ptat_metrics(dest_path, test_mode=test_name) 
                 ptat_power_avg_val = self.get_ptat_avg_power_value(dest_path, test_mode=test_name)
                 if ptat_errors:
                     all_failures.extend(ptat_errors)
                 else:
                     self.log("PTAT Check PASS.")
+
+                summary_csv_data.extend(ptat_data)
             except Exception as e:
                 all_failures.append(f"PTAT Error: {e}")
         else:
@@ -901,12 +1067,14 @@ class ODM_RunIn_Project(BaseRunInApp):
                 try:
                     shutil.copy2(src_gpu_log, dest_gpu_path)
                     # 傳入 test_mode=test_name
-                    gpu_errors = self.check_gpumon_metrics(dest_gpu_path, test_mode=test_name)
+                    gpu_errors, gpu_data = self.check_gpumon_metrics(dest_gpu_path, test_mode=test_name)
                     gpumon_power_avg_val = self.get_gpumon_power_avg(dest_gpu_path, test_mode=test_name)
                     if gpu_errors:
                         all_failures.extend(gpu_errors)
                     else:
-                        self.log("GPUMon Check PASS.")                       
+                        self.log("GPUMon Check PASS.")    
+
+                    summary_csv_data.extend(gpu_data)                   
                 except Exception as e:
                     all_failures.append(f"GPUMon Error: {e}")
             else:
@@ -918,24 +1086,53 @@ class ODM_RunIn_Project(BaseRunInApp):
         # ==========================================
         total_pwr = ptat_power_avg_val + gpumon_power_avg_val
         self.log(f"[Power Check] CPU: {ptat_power_avg_val:.2f}W + GPU: {gpumon_power_avg_val:.2f}W = Total: {total_pwr:.2f}W")
-
+        
         try:
             # 從 Config 讀取 Total Power Spec
             # 格式: Test1_TotalPower_Min / Max
             spec_min = float(self.config['Block1_Thermal'].get(f'{test_name}_TotalPower_Min', 0))
             spec_max = float(self.config['Block1_Thermal'].get(f'{test_name}_TotalPower_Max', 9999))
             
+            res_pwr = "PASS"
             if not (spec_min <= total_pwr <= spec_max):
                 msg = f"Total Power FAIL: {total_pwr:.2f}W (Spec: {spec_min}~{spec_max})"
                 self.log(msg)
                 all_failures.append(msg)
+                res_pwr = "FAIL"
             else:
                 self.log(f"Total Power PASS")
-                
+            
+            summary_csv_data.append({
+                "Item": "Total_Power", "Value": total_pwr, 
+                "Min": spec_min, "Max": spec_max, "Result": res_pwr
+            })    
         except ValueError:
             self.log("Warning: Invalid Total Power Spec in Config (Check format).")
         except Exception as e:
             all_failures.append(f"Total Power Check Error: {e}")
+        # =========Add thermal summary file=================================    
+        try:
+            timestamp_str = datetime.now().strftime("%Y%m%d%H%M%S")
+            # 檔名規則: PASS/FAIL_%timestamp%_cpu_only/dual.csv
+            status_prefix = "FAIL" if all_failures else "PASS"
+            mode_suffix = "cpu_only" if test_name == "Test1" else "dual"
+            
+            summary_filename = f"{status_prefix}_{timestamp_str}_{mode_suffix}.csv"
+            summary_path = os.path.join(log_dir, summary_filename)
+            
+            with open(summary_path, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=["Item", "Value", "Min", "Max", "Result"])
+                writer.writeheader()
+                for row in summary_csv_data:
+                    if isinstance(row["Value"], float):
+                        row["Value"] = f"{row['Value']:.1f}"
+                    writer.writerow(row)
+            
+            self.log(f"Verification Summary saved to: {summary_filename}")
+            
+        except Exception as e:
+            self.log(f"Error generating summary CSV: {e}")
+        # ==========================================
         # 最終判定
         if all_failures:
             error_summary = " | ".join(all_failures)
@@ -964,9 +1161,11 @@ class ODM_RunIn_Project(BaseRunInApp):
                 if bat:
                     current_pct = bat.percent
                     is_plugged = bat.power_plugged
-                    status_str = "Charging" if is_plugged else "Discharging"
-                    
+                    status_str = "Charging" if is_plugged else "Discharging"                   
                     self.log(f"Battery Status: {current_pct}% ({status_str}) / Target: {threshold}%")
+
+                    charging_current = self.ec.get_charging_current()
+                    self.log(f"Battery charging current: {charging_current}mA")
 
                     if current_pct >= threshold:
                         self.log("Battery Threshold Reached!")
@@ -1009,6 +1208,7 @@ class ODM_RunIn_Project(BaseRunInApp):
             cmd_furmark = r"start .\RI\FurMark\FurMark_GUI.exe"
             try:
                 # 呼叫共用函式: 傳入 "Test1"
+                self.check_battery_threshold()
                 self.run_stress_test_common("Test1", cmd_furmark, cmd_prime95)
                 
                 # 若沒拋出 Exception 代表 PASS
