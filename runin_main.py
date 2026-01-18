@@ -10,7 +10,7 @@ import shutil  # 用於複製檔案
 from datetime import datetime, timedelta
 from PyQt5.QtWidgets import QApplication, QMessageBox
 from core import BaseRunInApp
-from PyQt5.QtCore import Qt, QThread, QLockFile, QDir, QTimer
+from PyQt5.QtCore import Qt, QThread, QLockFile, QDir, QTimer, pyqtSignal
 
 # ==========================================
 # Helper: EC io txrx class
@@ -128,6 +128,7 @@ class DirectEC:
 # Helper: 風扇監控執行緒 (背景執行)
 # ==========================================
 class FanMonitorThread(QThread):
+    update_signal = pyqtSignal(int, int, int)
     def __init__(self, csv_path, interval=1):
         super().__init__()
         self.csv_path = csv_path
