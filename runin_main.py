@@ -115,13 +115,18 @@ class DirectEC:
         if not self.initialized: return 0
         
         CMD = 0x31
-        payload = [0x0C]
+        payload = [0x05]
         
         for _ in range(3):
             resp = self.txrx(CMD, payload, expect_len=2, wait_s=0.1)
             if resp and len(resp) == 2:
-                chg_current = resp[0] | (resp[1] << 8)
-                return chg_current
+                # 1. 先組合成 Unsigned 16-bit (0 ~ 65535)
+                raw_val = resp[0] | (resp[1] << 8)               
+                # 2. Signed 16-bit (Two's Complement)
+                if raw_val >= 32768:
+                    raw_val -= 65536
+                    
+                return raw_val
         return 0
         
 # ==========================================
@@ -259,7 +264,15 @@ class ODM_RunIn_Project(BaseRunInApp):
             last_status = state.get("status", "IDLE")
 
             self.log(f">>> RESUMING Block {current_block}, Step {current_step} <<<")
-
+            if last_status == "FINISHED_PASS":
+                self.log("Test Previously PASSED. Showing Result...")
+                self.worker.sig_finished.emit(True, "Loaded from State History")
+                return 
+            
+            if last_status == "FINISHED_FAIL":
+                self.log("Test Previously FAILED. Showing Result...")
+                self.worker.sig_finished.emit(False, "Loaded from State History")
+                return 
             # 偵測非預期當機 (上次狀態仍為 RUNNING)
             if last_status == "REBOOTING":
                 self.log(">>> System returned from Reboot Test. Resuming...")
@@ -273,8 +286,8 @@ class ODM_RunIn_Project(BaseRunInApp):
                     f.write(f"Crash at Block {current_block} Step {current_step}\n")
 
                 # 跳過該步驟，避免無限重啟
-                current_step += 1
-                self.save_state(current_block, current_step, current_cycle, status="IDLE")
+                # current_step += 1
+                # self.save_state(current_block, current_step, current_cycle, status="IDLE")
 
         # ---------------------------------------------------
         # Block 1: Thermal
@@ -504,7 +517,9 @@ class ODM_RunIn_Project(BaseRunInApp):
         # 3. 檢查每個 Key
         for target_col_name in ptat_keys:
             if target_col_name not in header_map:
-                self.log(f"WARNING: Column '{target_col_name}' not found! Skipping.")
+                msg = f"Config Error: Column '{target_col_name}' not found in CSV"
+                self.log(msg)
+                errors.append(msg) 
                 continue
                 
             col_idx = header_map[target_col_name]
@@ -857,7 +872,6 @@ class ODM_RunIn_Project(BaseRunInApp):
             self.log(f"[{test_name}] GPUMon Disabled.")
         try:
             # 0. set fan mode
-
             fan_mode = self.config['Block1_Thermal'].get('Fan_Mode', None)
             if fan_mode and str(fan_mode).strip():
                 fan_mode = str(fan_mode).strip()
@@ -1205,7 +1219,7 @@ class ODM_RunIn_Project(BaseRunInApp):
         if start_from_step <= 1:
             self.log("[Test 1] Single Stress Start")
             self.set_status(f"Cycle {current_cycle} | Running Test 1: Single Stress")
-            cmd_prime95 = r".\RI\prime95\prime95.exe -t -small -A16"
+            cmd_prime95 = r".\RI\prime95\prime95.exe -t -small"
             cmd_furmark = r"start .\RI\FurMark\FurMark_GUI.exe"
             try:
                 # 呼叫共用函式: 傳入 "Test1"
@@ -1254,7 +1268,7 @@ class ODM_RunIn_Project(BaseRunInApp):
                 time.sleep(1)
             self.check_battery_threshold() 
             self.log("[Test 3] Dual Stress Test")
-            cmd_prime95 = r".\RI\prime95\prime95.exe -t -small -A16"
+            cmd_prime95 = r".\RI\prime95\prime95.exe -t -small"
             cmd_furmark = r".\RI\FurMark\furmark.exe --demo furmark-gl --benchmark --max-time 1390 --no-score-box"
             try:
                 # 呼叫共用函式: 傳入 "Test3"
@@ -1363,6 +1377,16 @@ class ODM_RunIn_Project(BaseRunInApp):
     def run_block_3(self, current_cycle=1):
         try:
             tool_path = os.path.join(self.base_dir, "RI", "DiagECtool.exe") 
+            fan_mode = self.config['Block1_Thermal'].get('Fan_Mode', None)
+            if fan_mode and str(fan_mode).strip():
+                fan_mode = str(fan_mode).strip()
+                self.log(f"Set Fan Mode: {fan_mode}")
+                self.exec_cmd_wait(f"{tool_path} raw --cmd 0x20 --subcmd 0x01 --data 0x03", capture_log=True)
+                self.exec_cmd_wait(f"{tool_path} raw --cmd 0x20 --subcmd 0x06 --data 0x0{fan_mode}", capture_log=True)
+                for _ in range(10):
+                    self.check_stop()
+                    QApplication.processEvents()
+                    time.sleep(1)
             self.log("--- Block 3: Battery Charge/Discharge ---")
             self.set_status(f"Cycle {current_cycle} | Running Block 3: Battery Charge/Discharge") 
             self.log(f"Battery percentage:{psutil.sensors_battery().percent}")
@@ -1370,8 +1394,10 @@ class ODM_RunIn_Project(BaseRunInApp):
             self.exec_cmd_wait(r"call .\RI\BatteryControl.bat")
         except Exception as e:
             self.log(f"Error : {e}")
+            raise e
         finally:
             self.exec_cmd_wait(f"{tool_path} battery --mode auto", capture_log=True)
+            self.exec_cmd_wait(f"{tool_path} fan --mode auto", capture_log=True)
 if __name__ == "__main__":
     try:
         hwnd = ctypes.windll.kernel32.GetConsoleWindow()
