@@ -118,7 +118,11 @@ class BaseRunInApp(QMainWindow):
 
         # 啟動檢查
         self.check_previous_log()
+        self.disable_runonce = "--factory" in sys.argv
+        if self.disable_runonce:
+            print("[System] Factory mode RunOnce Registry disabled (Managed by external launcher).")
 
+        self.last_saved_state = {}
         # Config 讀取
         self.config = configparser.ConfigParser()
         if os.path.exists("config.ini"):
@@ -296,6 +300,7 @@ class BaseRunInApp(QMainWindow):
     def save_state(self, block, step, cycle=1, status="IDLE"):
         state = {"block": block, "step": step, "cycle": cycle, "status": status}
         with open(self.state_file, "w") as f: json.dump(state, f)
+        self.last_saved_state = state
 
     def load_state(self):
         if os.path.exists(self.state_file):
@@ -310,14 +315,16 @@ class BaseRunInApp(QMainWindow):
             self.check_stop()
             self.is_rebooting = True
 
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\RunOnce", 0, winreg.KEY_WRITE)
-            cmd = f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}"'
-            winreg.SetValueEx(key, "ODM_RunIn", 0, winreg.REG_SZ, cmd)
-            winreg.CloseKey(key)
+            if not self.disable_runonce:
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\RunOnce", 0, winreg.KEY_WRITE)
+                cmd = f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}"'
+                winreg.SetValueEx(key, "ODM_RunIn", 0, winreg.REG_SZ, cmd)
+                winreg.CloseKey(key)
+                self.log("RunOnce Registry Key Set (Standalone Mode).")
+            else:
+                self.log("Skipping RunOnce Registry (Managed Mode).")
             
-            self.log("Reboot triggered. Shutting down...")
-            # self.archive_log(prefix="Runin_Debug_Reboot_")  <-- 註解掉或刪除這行
-            
+            self.log("Reboot triggered. Shutting down...")            
             subprocess.run("shutdown /r /t 0 /f", shell=True)
             while True: time.sleep(1)
         except Exception as e:
@@ -327,6 +334,9 @@ class BaseRunInApp(QMainWindow):
         
     def set_run_once_startup(self):
         """將目前的程式註冊到 Windows RunOnce，下次開機自動執行一次"""
+        if self.disable_runonce:
+            self.log("Skipping RunOnce for S4/ColdBoot (Managed Mode).")
+            return
         try:
             # 1. 取得目前執行檔的路徑
             if getattr(sys, 'frozen', False):
@@ -374,26 +384,29 @@ class BaseRunInApp(QMainWindow):
             self.btn_start.setText("STOPPED")
             self.btn_start.setEnabled(False)
             self.btn_stop.setEnabled(False)
-            self.clear_state()
+            #self.clear_state()
         else:
             self.btn_start.setEnabled(False)
-            #self.btn_start.setText("FINISHED")
             self.btn_stop.setEnabled(False)
             
             if final_result:
                 self.btn_start.setText("PASS")
-                self.set_status("ALL PASS")
-                self.btn_start.setStyleSheet("background-color: #00C853; color: white; font-weight: bold; font-size: 72px;")
-                self.log("=== TEST FINISHED: PASS ===")
-                self.clear_state()
+                if self.last_saved_state:
+                    self.save_state(
+                        self.last_saved_state.get("block", "1"),
+                        self.last_saved_state.get("step", 0),
+                        self.last_saved_state.get("cycle", 1),
+                        status="FINISHED_PASS"
+                    )
             else:
                 self.btn_start.setText("FAIL")
-                self.set_status("TEST FAILED")
-                self.btn_start.setStyleSheet("background-color: #D50000; color: white; font-weight: bold; font-size: 72px;")
-                self.txt_log.append("<br><hr>")
-                self.txt_log.append(f"<h1 style='color: red; background-color: #ffe6e6;'>!!! FAIL REASON:</h1>")
-                self.txt_log.append(f"<h2 style='color: red;'>{msg}</h2>")
-                self.log("=== TEST STOPPED: FAIL ===")
+                if self.last_saved_state:
+                    self.save_state(
+                        self.last_saved_state.get("block", "1"),
+                        self.last_saved_state.get("step", 0),
+                        self.last_saved_state.get("cycle", 1),
+                        status="FINISHED_FAIL"
+                    )
         
         # 產生結果檔
         self.generate_result_file(final_result)     
@@ -427,13 +440,13 @@ class BaseRunInApp(QMainWindow):
                     break
         # -----------------------------        
         try:
-            self.log("Resetting hardware to Auto mode...")
+            print("Resetting hardware to Auto mode...")
             # 假設 DiagECtool 在 .\RI\DiagECtool.exe
             tool_exe = os.path.join(os.getcwd(), "RI", "DiagECtool.exe")            
             subprocess.run(f"{tool_exe} battery --mode auto", shell=True, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.log("Resetting battery to Auto mode...")
+            print("Resetting battery to Auto mode...")
             subprocess.run(f"{tool_exe} fan --mode auto", shell=True, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.log("Resetting fan to Auto mode...")        
+            print("Resetting fan to Auto mode...")        
         except Exception as e:
             print(f"Hardware reset error: {e}")
         # ----------------------------- 
