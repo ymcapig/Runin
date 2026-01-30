@@ -316,7 +316,7 @@ class BaseRunInApp(QMainWindow):
             self.is_rebooting = True
 
             if not self.disable_runonce:
-                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\RunOnce", 0, winreg.KEY_WRITE)
+                key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\RunOnce", 0, winreg.KEY_WRITE)
                 cmd = f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}"'
                 winreg.SetValueEx(key, "ODM_RunIn", 0, winreg.REG_SZ, cmd)
                 winreg.CloseKey(key)
@@ -349,7 +349,7 @@ class BaseRunInApp(QMainWindow):
                 return
 
             # 2. 開啟登錄檔路徑
-            key = winreg.OpenKey(
+            key = winreg.CreateKey(
                 winreg.HKEY_CURRENT_USER,
                 r"Software\Microsoft\Windows\CurrentVersion\RunOnce",
                 0, 
