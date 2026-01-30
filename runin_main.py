@@ -279,11 +279,11 @@ class ODM_RunIn_Project(BaseRunInApp):
 
             if last_status == "RUNNING":
                 self.log(f"!!! DETECTED CRASH/HANG AT BLOCK {current_block} STEP {current_step} !!!")
-                self.log("Marking this step as FAIL and skipping...")
+                self.log("Detected Crash. Retrying this step (Production Mode)...")
                 
                 # 簡單的 Fail Log
                 with open("RunIn_Crash.log", "a") as f:
-                    f.write(f"Crash at Block {current_block} Step {current_step}\n")
+                    f.write(f"Crash at Block {current_block} Step {current_step} - Retrying...\n")
 
                 # 跳過該步驟，避免無限重啟
                 # current_step += 1
@@ -928,7 +928,13 @@ class ODM_RunIn_Project(BaseRunInApp):
             if is_gpumon_enabled:
                 gpu_mon_dir = os.path.join(self.base_dir, "RI", "GPUMon")
                 if not os.path.exists(gpu_mon_dir): os.makedirs(gpu_mon_dir)
-                
+                gpu_ppab_cmd = f"GPUMonCmd.exe -db:0"
+                self.log(f"Disable PPAB: {gpu_ppab_cmd}")
+                subprocess.Popen(gpu_ppab_cmd, cwd=gpu_mon_dir, shell=True)
+                for _ in range(10):
+                    self.check_stop()
+                    QApplication.processEvents()
+                    time.sleep(1)
                 # 這裡 Log 檔名先用暫存的，最後再備份改名
                 gpu_temp_log = "cpu_gpumon.csv" 
                 gpu_cmd = f"GPUMonCmd.exe -custom:timestamp,temp,pwr,clk -wake -log:{gpu_temp_log}"
@@ -965,6 +971,13 @@ class ODM_RunIn_Project(BaseRunInApp):
             self.ensure_process_killed("PTAT.exe")           
             # 2. 停 GPUMon
             if is_gpumon_enabled:
+                gpu_ppab_cmd = f"GPUMonCmd.exe -db:1"
+                self.log(f"Enable PPAB: {gpu_ppab_cmd}")
+                subprocess.Popen(gpu_ppab_cmd, cwd=gpu_mon_dir, shell=True)
+                for _ in range(10):
+                    self.check_stop()
+                    QApplication.processEvents()
+                    time.sleep(1)
                 self.ensure_process_killed("GPUMonCmd.exe")           
             # 3. 停 Fan Monitor
             if fan_thread: fan_thread.stop()
