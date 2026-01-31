@@ -1110,8 +1110,52 @@ class ODM_RunIn_Project(BaseRunInApp):
                 all_failures.append("GPUMon Log missing")
                 
         # ==========================================
-        # 4. 總功耗檢查 (Total Power Check)
+        # 4. 功耗檢查 (Power Check)
         # ==========================================
+        # 4.1 CPU
+        try:
+            # 讀取 Config (若沒設則預設 0~9999)
+            cpu_min = float(self.config['Block1_Thermal'].get(f'{test_name}_CPUPower_Min', 0))
+            cpu_max = float(self.config['Block1_Thermal'].get(f'{test_name}_CPUPower_Max', 9999))
+            
+            res_cpu = "PASS"
+            if not (cpu_min <= ptat_power_avg_val <= cpu_max):
+                msg = f"CPU Power FAIL: {ptat_power_avg_val:.2f}W (Spec: {cpu_min}~{cpu_max})"
+                self.log(msg)
+                all_failures.append(msg)
+                res_cpu = "FAIL"
+            else:
+                self.log(f"CPU Power PASS: {ptat_power_avg_val:.2f}W")
+            
+            summary_csv_data.append({
+                "Item": "CPU_Power_Avg", "Value": ptat_power_avg_val, 
+                "Min": cpu_min, "Max": cpu_max, "Result": res_cpu
+            })
+        except Exception as e:
+            all_failures.append(f"CPU Power Check Error: {e}")
+
+        # 4.2 GPU Power
+        if is_gpumon_enabled and test_name == "Test3":
+            try:
+                gpu_min = float(self.config['Block1_Thermal'].get(f'{test_name}_GPUPower_Min', 0))
+                gpu_max = float(self.config['Block1_Thermal'].get(f'{test_name}_GPUPower_Max', 9999))
+                
+                res_gpu = "PASS"
+                if not (gpu_min <= gpumon_power_avg_val <= gpu_max):
+                    msg = f"GPU Power FAIL: {gpumon_power_avg_val:.2f}W (Spec: {gpu_min}~{gpu_max})"
+                    self.log(msg)
+                    all_failures.append(msg)
+                    res_gpu = "FAIL"
+                else:
+                    self.log(f"GPU Power PASS: {gpumon_power_avg_val:.2f}W")
+                
+                summary_csv_data.append({
+                    "Item": "GPU_Power_Avg", "Value": gpumon_power_avg_val, 
+                    "Min": gpu_min, "Max": gpu_max, "Result": res_gpu
+                })
+            except Exception as e:
+                all_failures.append(f"GPU Power Check Error: {e}")
+
         total_pwr = ptat_power_avg_val + gpumon_power_avg_val
         self.log(f"[Power Check] CPU: {ptat_power_avg_val:.2f}W + GPU: {gpumon_power_avg_val:.2f}W = Total: {total_pwr:.2f}W")
         
