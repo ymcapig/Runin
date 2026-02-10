@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from PyQt5.QtWidgets import QApplication, QMessageBox
 from core import BaseRunInApp
 from PyQt5.QtCore import Qt, QThread, QLockFile, QDir, QTimer, pyqtSignal
-
+import json
 # ==========================================
 # Helper: EC io txrx class
 # ==========================================
@@ -221,6 +221,15 @@ class FanMonitorThread(QThread):
 class ODM_RunIn_Project(BaseRunInApp):
 
     def __init__(self, title="ODM Run-In"):
+        self.global_cycle = 1
+        self.block1_cycle = 1
+        self.block2_cycle = 1
+        self.block3_cycle = 1
+
+        self.total_global_cycles = 1
+        self.total_b1_cycles = 1
+        self.total_b2_cycles = 1
+        self.total_b3_cycles = 1
         super().__init__(title=title)   
         # 設定一個 Timer，在介面顯示後 1 秒檢查是否要 Auto Run
         # 這樣可以確保 UI 已經完全 Load 好
@@ -233,6 +242,25 @@ class ODM_RunIn_Project(BaseRunInApp):
         QTimer.singleShot(1000, self.check_auto_run)
         ri_folder = os.path.join(self.base_dir, "RI")
         self.ec = DirectEC(ri_folder)
+
+    def save_state(self, block, step, cycle=1, status="IDLE"):
+        state = {
+            "block": str(block),
+            "step": int(step),
+            "cycle": int(self.global_cycle),         # 使用 self 成員
+            "block1_cycle": int(self.block1_cycle),  # 保存 B1 Cycle
+            "block2_cycle": int(self.block2_cycle),  # 保存 B2 Cycle
+            "block3_cycle": int(self.block3_cycle),  # 保存 B3 Cycle
+            "status": status,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        try:
+            # 寫入 core.py 指定的 self.state_file (runin_state.json)
+            with open(self.state_file, "w") as f:
+                json.dump(state, f, indent=4)
+            self.last_saved_state = state # 更新 Core 的快取
+        except Exception as e:
+            self.log(f"Save State Error: {e}")
 
     # Auto Run 檢查邏輯
     def check_auto_run(self):
@@ -249,21 +277,44 @@ class ODM_RunIn_Project(BaseRunInApp):
         except Exception as e:
             self.log(f"AutoRun Error: {e}")
 
+    def fmt_status(self, block_name, action):
+        b_cyc = 0
+        b_total = 0
+        if "Block 1" in block_name:
+            b_cyc = self.block1_cycle
+            b_total = self.total_b1_cycles
+        elif "Block 2" in block_name:
+            b_cyc = self.block2_cycle
+            b_total = self.total_b2_cycles
+        elif "Block 3" in block_name:
+            b_cyc = self.block3_cycle
+            b_total = self.total_b3_cycles
+            
+        return f"[{block_name}] Global: {self.global_cycle}/{self.total_global_cycles} | Cycle: {b_cyc}/{b_total} | {action}"
+    
     def user_test_sequence(self):
         state = self.load_state()
         current_block = "1"
         current_step = 0
-        current_cycle = 1
         last_status = "IDLE"
 
+        self.total_global_cycles = int(self.config['Global'].get('Total_RunIn_Cycles', 1))
+        self.total_b1_cycles = int(self.config['Block1_Thermal'].get('Cycles', 1))
+        self.total_b2_cycles = int(self.config['Block2_Aging'].get('Cycles', 1))
+        self.total_b3_cycles = int(self.config['Block3_Battery'].get('Cycles', 1))
         # 斷點續傳恢復邏輯
         if state:
             current_block = state.get("block", "1")
             current_step = state.get("step", 0)
-            current_cycle = state.get("cycle", 1)
+            self.global_cycle = state.get("cycle", 1) # 為了相容舊版 key 暫時保留
+            self.block1_cycle = state.get("block1_cycle", 1)
+            self.block2_cycle = state.get("block2_cycle", 1)
+            self.block3_cycle = state.get("block3_cycle", 1)
             last_status = state.get("status", "IDLE")
 
             self.log(f">>> RESUMING Block {current_block}, Step {current_step} <<<")
+            self.log(f"Current Cycles -> B1: {self.block1_cycle}, B2: {self.block2_cycle}, B3: {self.block3_cycle}")
+
             if last_status == "FINISHED_PASS":
                 self.log("Test Previously PASSED. Showing Result...")
                 self.worker.sig_finished.emit(True, "Loaded from State History")
@@ -287,69 +338,92 @@ class ODM_RunIn_Project(BaseRunInApp):
 
                 # 跳過該步驟，避免無限重啟
                 # current_step += 1
-                # self.save_state(current_block, current_step, current_cycle, status="IDLE")
+                # self.save_state(current_block, current_step, self.global_cycle, "IDLE")
 
         # ---------------------------------------------------
         # Block 1: Thermal
         # ---------------------------------------------------
         if current_block == "1":
             if self.config['Block1_Thermal'].getboolean('Enabled'):
-                self.run_block_1(start_from_step=current_step, current_cycle=current_cycle)
-                current_block = "2"
-                current_step = 0
-                self.save_state("2", 0, current_cycle, status="IDLE")
+                if self.block1_cycle <= self.total_b1_cycles:
+                    self.log(f"--- Block 1: Cycle {self.block1_cycle}/{self.total_b1_cycles} ---")
+                    self.run_block_1(start_from_step=current_step, current_cycle=self.block1_cycle)
+                    if self.block1_cycle < self.total_b1_cycles:
+                        self.block1_cycle += 1
+                        current_step = 0 # 重置步驟
+                        self.log(f"Block 1 Cycle Finished. Proceeding to Cycle {self.block1_cycle}...")
+                        self.save_state("1", 0, self.global_cycle, "IDLE")
+                        self.trigger_reboot()
+                        return
+                    else:
+                        # Block 1 全部圈數跑完，進入 Block 2
+                        self.log("Block 1 All Cycles Finished.")
+                        current_block = "2"
+                        current_step = 0
+                        self.save_state("2", 0, self.global_cycle, "IDLE")
             else:
                 self.log("Block 1 is Disabled. Skipping to Block 2...")
                 current_block = "2"
-                self.save_state("2", 0, current_cycle, status="IDLE")
-
+                self.save_state("2", 0, self.global_cycle, "IDLE")
         # ---------------------------------------------------
         # Block 2: Aging
         # ---------------------------------------------------
         if current_block == "2":
             if self.config['Block2_Aging'].getboolean('Enabled'):
-                self.run_block_2(start_from_step=current_step, current_cycle=current_cycle)
-                current_block = "3"
-                current_step = 0
-                self.save_state("3", 0, current_cycle, status="IDLE")
+                if self.block2_cycle <= self.total_b2_cycles:
+                    self.log(f"--- Block 2: Cycle {self.block2_cycle}/{self.total_b2_cycles} ---")
+                    self.run_block_2(start_from_step=current_step, current_cycle=self.block2_cycle)
+                    
+                    if self.block2_cycle < self.total_b2_cycles:
+                        self.block2_cycle += 1
+                        current_step = 0
+                        self.log(f"Block 2 Cycle Finished. Proceeding to Cycle {self.block2_cycle}...")
+                        self.save_state("2", 0, self.global_cycle, "IDLE")
+                        self.trigger_reboot()
+                        return
+                    else:
+                        self.log("Block 2 All Cycles Finished.")
+                        current_block = "3"
+                        current_step = 0
+                        self.save_state("3", 0, self.global_cycle, "IDLE")
             else:
-                self.log("Block 2 is Disabled. Skipping to Block 3...")
+                self.log("Block 2 is Disabled. Skipping...")
                 current_block = "3"
-                self.save_state("3", 0, current_cycle, status="IDLE")
+                self.save_state("3", 0, self.global_cycle, "IDLE")
 
         # ---------------------------------------------------
         # Block 3: Battery
         # ---------------------------------------------------
         if current_block == "3":
             if self.config['Block3_Battery'].getboolean('Enabled'):
-                self.run_block_3(current_cycle=current_cycle)
+                if self.block3_cycle <= self.total_b3_cycles:
+                    self.log(f"--- Block 3: Cycle {self.block3_cycle}/{self.total_b3_cycles} ---")
+                    self.run_block_3() # Block 3 比較簡單，通常是單次 Script
+                    
+                    if self.block3_cycle < self.total_b3_cycles:
+                        self.block3_cycle += 1
+                        self.log(f"Block 3 Cycle Finished. Proceeding to Cycle {self.block3_cycle}...")
+                        self.save_state("3", 0, self.global_cycle, "IDLE")
+                        self.trigger_reboot()
+                        return
+                    else:
+                         self.log("Block 3 All Cycles Finished.")
+                         # 全部結束
             else:
                 self.log("Block 3 is Disabled. Skipping...")
-
-            try:
-                total_cycles = int(self.config['Global']['Total_RunIn_Cycles'])
-            except:
-                total_cycles = 1 # 預設值
             
-            if current_cycle < total_cycles:
-                next_cycle = current_cycle + 1
-                self.log(f"=== Cycle {current_cycle} Finished. Starting Cycle {next_cycle}/{total_cycles} ===")                
-                # 設定狀態回到 Block 1, Step 0，並更新 Cycle數
-                self.save_state("1", 0, next_cycle, status="IDLE")
-                # 為了確保測試環境乾淨，通常建議重開機進入下一輪
-                self.log("Rebooting system for the next cycle...")
+            if self.global_cycle < self.total_global_cycles:
+                self.global_cycle += 1
+                self.log(f"=== Global Cycle Finished. Starting Global Cycle {self.global_cycle}/{self.total_global_cycles} ===")
+                self.block1_cycle = 1
+                self.block2_cycle = 1
+                self.block3_cycle = 1
+                self.save_state("1", 0, self.global_cycle, "IDLE")
                 self.trigger_reboot()
-                return # 結束本次執行，等待重開機
+                return
             
             self.clear_state()
-            self.log("=== ALL BLOCKS FINISHED ===")
-        
-            # if 'Global' in self.config and self.config['Global'].getboolean('AutoClose'):
-            #     self.log("[AutoClose] Closing application in 3 seconds...")
-            #     # 為了讓使用者看到 PASS，延遲 3 秒再關閉
-            #     import time
-            #     time.sleep(3)
-            #     QApplication.quit()
+            self.log("=== ALL BLOCKS FINISHED ===")   
 
     # --- Helper: 計算 CSV 平均值 ---
     def analyze_fan_log_average(self, csv_path, col_idx, duration_sec=120):
@@ -1253,6 +1327,26 @@ class ODM_RunIn_Project(BaseRunInApp):
             
             # 等待 5 秒再檢查
             time.sleep(5)
+
+    def update_state_step(self, block, step, status):
+        import json
+        try:
+            if os.path.exists("runin_state.json"):
+                with open("runin_state.json", "r") as f:
+                    state = json.load(f)
+            else:
+                state = {}
+            
+            state["block"] = str(block)
+            state["step"] = int(step)
+            state["status"] = status
+            state["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            with open("runin_state.json", "w") as f:
+                json.dump(state, f, indent=4)
+        except Exception as e:
+            self.log(f"Update State Error: {e}")
+            
     # ==========================================
     # Block 1 實作 (Thermal)
     # ==========================================
@@ -1268,87 +1362,97 @@ class ODM_RunIn_Project(BaseRunInApp):
             if i % 10 == 0: QApplication.processEvents()
             time.sleep(1)
         if start_from_step == 0:
+            self.set_status(self.fmt_status("Block 1", "Waiting for Battery"))
             self.check_battery_threshold() 
-            self.save_state("1", 1, current_cycle, status="IDLE")
+            self.save_state("1", 1, self.global_cycle, "IDLE")
         # ==========================================
         # [Test 1] Single Stress
         # ==========================================
+        test1_duration = int(self.config['Block1_Thermal'].get('Test1_Duration', 1200))
         if start_from_step <= 1:
-            self.log("[Test 1] Single Stress Start")
-            self.set_status(f"Cycle {current_cycle} | Running Test 1: Single Stress")
-            cmd_prime95 = r".\RI\prime95\prime95.exe -t -small"
-            cmd_furmark = r"start .\RI\FurMark\FurMark_GUI.exe"
-            try:
-                # 呼叫共用函式: 傳入 "Test1"
-                self.check_battery_threshold()
-                self.run_stress_test_common("Test1", cmd_furmark, cmd_prime95)
-                
-                # 若沒拋出 Exception 代表 PASS
-                self.save_state("1", 2, current_cycle, status="IDLE")
-                if self.config['Block1_Thermal'].getboolean('Test1_Reboot'):
-                    self.log("Rebooting as per config...")
-                    self.trigger_reboot()
-            except Exception as e:
-                # 錯誤已在 run_stress_test_common Log 過，這裡直接往上拋即可
-                raise e
+            if test1_duration <= 0:
+                self.log("[Test 1] Duration=0, Skipping...")
+                self.save_state("1", 2, self.global_cycle, "IDLE")
+            else:    
+                self.log("[Test 1] Single Stress Start")
+                self.set_status(self.fmt_status("Block 1", "Test 1: Single Stress"))
+                #self.set_status(f"Cycle {current_cycle} | Running Test 1: Single Stress")
+                cmd_prime95 = r".\RI\prime95\prime95.exe -t -small"
+                cmd_furmark = r"start .\RI\FurMark\FurMark_GUI.exe"
+                try:
+                    # 呼叫共用函式: 傳入 "Test1"
+                    self.check_battery_threshold()
+                    self.run_stress_test_common("Test1", cmd_furmark, cmd_prime95)
+                    
+                    # 若沒拋出 Exception 代表 PASS
+                    self.save_state("1", 2, self.global_cycle, "IDLE")
+                    if self.config['Block1_Thermal'].getboolean('Test1_Reboot'):
+                        self.log("Rebooting as per config...")
+                        self.trigger_reboot()
+                except Exception as e:
+                    # 錯誤已在 run_stress_test_common Log 過，這裡直接往上拋即可
+                    raise e
         # Step 2: Fan Max Speed
+        fan_count = int(self.config['Block1_Thermal'].get('Test2_Fan_Count', 2))
         if start_from_step <= 2:
-            self.log("Sleep 3min before Fan test...")   
-            self.set_status(f"Cycle {current_cycle} | Running Test 2: Fan Speed Test")      
-            for i in range(180):
-                if i % 10 == 0: QApplication.processEvents()
-                time.sleep(1)
-            self.log("[Test 2] Fan Speed Test Start")   
-            self.log(f"Battery percentage:{psutil.sensors_battery().percent}")     
-            try:
-                # 呼叫剛剛寫好的 Helper 函式
-                self.run_fan_curve_test()
-                self.log("Test 2 PASS.")               
-                # 測試通過後，儲存狀態並準備重開機
-                self.save_state("1", 3, current_cycle, status="IDLE")                
-                # 檢查 Config 是否需要重開機 (需求說 PASS 後 Reboot 往 Test 3)
-                if self.config['Block1_Thermal'].getboolean('Test2_Reboot'):
-                    self.log("Rebooting for Test 3...")
-                    self.trigger_reboot()
-                else:
-                    self.log("Skipping Reboot, moving to Test 3...")
-            except Exception as e:
-                self.log(f"Test 2 FAILED: {e}")
-                # 這裡直接 raise，core.py 會捕捉並停止測試 (STOPPED: FAIL)
-                raise e           
+            if fan_count <= 0:
+                self.log("[Test 2] Fan_Count=0, Skipping...")
+                self.save_state("1", 3, self.global_cycle, "IDLE")
+            else:
+                self.set_status(self.fmt_status("Block 1", "Sleep 3min before Fan test..."))
+                self.log("Sleep 3min before Fan test...")   
+                #self.set_status(f"Cycle {current_cycle} | Running Test 2: Fan Speed Test")      
+                for i in range(180):
+                    if i % 10 == 0: QApplication.processEvents()
+                    time.sleep(1)
+                self.log("[Test 2] Fan Speed Test Start")   
+                self.set_status(self.fmt_status("Block 1", "Test 2: Fan Speed Test"))
+                self.log(f"Battery percentage:{psutil.sensors_battery().percent}")     
+                try:
+                    # 呼叫剛剛寫好的 Helper 函式
+                    self.run_fan_curve_test()
+                    self.log("Test 2 PASS.")               
+                    # 測試通過後，儲存狀態並準備重開機
+                    self.save_state("1", 3, self.global_cycle, "IDLE")               
+                    # 檢查 Config 是否需要重開機 (需求說 PASS 後 Reboot 往 Test 3)
+                    if self.config['Block1_Thermal'].getboolean('Test2_Reboot'):
+                        self.log("Rebooting for Test 3...")
+                        self.trigger_reboot()
+                    else:
+                        self.log("Skipping Reboot, moving to Test 3...")
+                except Exception as e:
+                    self.log(f"Test 2 FAILED: {e}")
+                    # 這裡直接 raise，core.py 會捕捉並停止測試 (STOPPED: FAIL)
+                    raise e           
         # Step 3: Dual Stress
+        test3_duration = int(self.config['Block1_Thermal'].get('Test3_Duration', 1200))
         if start_from_step <= 3:
-            self.log("Sleep 3min before Dual burn test...")    
-            self.set_status(f"Cycle {current_cycle} | Running Test 3: Dual Stress")     
-            for i in range(180):
-                if i % 10 == 0: QApplication.processEvents()
-                time.sleep(1)
-            self.check_battery_threshold() 
-            self.log("[Test 3] Dual Stress Test")
-            cmd_prime95 = r".\RI\prime95\prime95.exe -t -small"
-            cmd_furmark = r".\RI\FurMark\furmark.exe --demo furmark-gl --benchmark --max-time 1390 --no-score-box"
-            try:
-                # 呼叫共用函式: 傳入 "Test3"
-                self.run_stress_test_common("Test3", cmd_furmark, cmd_prime95)
-                self.log("Block 1 PASS. Moving to Block 2...")               
-               
-                # 若為最後一個 Step，準備接續
-                if self.config['Block1_Thermal'].getboolean('Test3_Reboot'):
-                     self.log("Rebooting before Block 2...")
-                     self.save_state("2", 0, current_cycle, status="IDLE")
-                     self.trigger_reboot()
-                else:
-                     self.save_state("2", 0, current_cycle, status="IDLE")
-
-            except Exception as e:
-                raise e
-            self.log("Block 1 PASS. Moving to Block 2...")
+            if test3_duration <= 0:
+                self.log("[Test 3] Duration=0, Skipping...")
+            else:
+                self.set_status(self.fmt_status("Block 1", "Sleep 3min before Dual burn test..."))
+                self.log("Sleep 3min before Dual burn test...")    
+                #self.set_status(f"B1-C{self.block1_cycle} | Running Test 3: Dual Stress")     
+                for i in range(180):
+                    if i % 10 == 0: QApplication.processEvents()
+                    time.sleep(1)
+                self.check_battery_threshold() 
+                self.set_status(self.fmt_status("Block 1", "Test 3: Dual Stress"))
+                self.log("[Test 3] Dual Stress Test")
+                cmd_prime95 = r".\RI\prime95\prime95.exe -t -small"
+                cmd_furmark = r".\RI\FurMark\furmark.exe --demo furmark-gl --benchmark --max-time 1390 --no-score-box"
+                try:
+                    # 呼叫共用函式: 傳入 "Test3"
+                    self.run_stress_test_common("Test3", cmd_furmark, cmd_prime95)
+                    self.log("Block 1 PASS.")                               
+                    # 若為最後一個 Step，準備接續
+                    # if self.config['Block1_Thermal'].getboolean('Test3_Reboot'):
+                    #     self.log("Rebooting...")
+                    #     self.trigger_reboot()
+                except Exception as e:
+                    raise e
+                self.log("Block 1 PASS. Moving to Block 2...")
             
-            if self.config['Block1_Thermal'].getboolean('Test3_Reboot'):
-                 self.log("Rebooting before Block 2...")
-                 self.save_state("2", 0, current_cycle, status="IDLE")
-                 self.trigger_reboot()
-
     # ==========================================
     # Block 2 實作 (Aging)
     # ==========================================
@@ -1405,33 +1509,33 @@ class ODM_RunIn_Project(BaseRunInApp):
         for idx, (test_name, cmd, will_interrupt, capture_log) in enumerate(items):
             if idx < start_from_step: continue           
             # 更新 UI 狀態
-            self.set_status(f"Cycle {current_cycle} | Aging Step {idx+1}/{len(items)}: {test_name}")
+            self.set_status(self.fmt_status("Block 2", f"Running {name}"))
             self.log(f"Starting {test_name}...")
             self.log(f"Battery percentage:{psutil.sensors_battery().percent}")
             # S3/S4 特殊處理 (Save RUNNING)
             if "sleeptest" in cmd.lower() or "coldboot" in cmd.lower(): 
                 if "coldboot" in cmd.lower():
-                    self.save_state("2", idx, current_cycle, status="REBOOTING")
+                    self.save_state("2", idx, self.global_cycle, status="REBOOTING")
                     self.set_run_once_startup()
                 else:
-                    self.save_state("2", idx, current_cycle, status="RUNNING")
+                    self.save_state("2", idx, self.global_cycle, status="RUNNING")
                 self.exec_cmd_wait(cmd, capture_log=capture_log)
-                self.save_state("2", idx + 1, current_cycle, status="IDLE")
+                self.save_state("2", idx + 1, self.global_cycle, status="IDLE")
                 continue
 
             # 一般重開機測試
             if will_interrupt:
-                self.save_state("2", idx + 1, current_cycle, status="IDLE")
+                self.save_state("2", idx + 1, self.global_cycle, status="IDLE")
                 self.exec_cmd_wait(cmd, capture_log=capture_log)
                 if "Boot" in cmd or "RTC" in cmd: return 
             else:
                 self.exec_cmd_wait(cmd, capture_log=capture_log)
-                self.save_state("2", idx + 1, current_cycle, status="IDLE")
+                self.save_state("2", idx + 1, self.global_cycle, status="IDLE")
 
     # ==========================================
     # Block 3 實作 (Battery)
     # ==========================================
-    def run_block_3(self, current_cycle=1):
+    def run_block_3(self):
         try:
             tool_path = os.path.join(self.base_dir, "RI", "DiagECtool.exe") 
             fan_mode = self.config['Block1_Thermal'].get('Fan_Mode', None)
@@ -1445,9 +1549,9 @@ class ODM_RunIn_Project(BaseRunInApp):
                     QApplication.processEvents()
                     time.sleep(1)
             self.log("--- Block 3: Battery Charge/Discharge ---")
-            self.set_status(f"Cycle {current_cycle} | Running Block 3: Battery Charge/Discharge") 
+            self.set_status(self.fmt_status("Block 3", "Running Battery Test")) 
             self.log(f"Battery percentage:{psutil.sensors_battery().percent}")
-            self.save_state("3", 0, current_cycle, status="RUNNING")
+            self.save_state("3", 0, self.global_cycle, status="RUNNING")
             self.exec_cmd_wait(r"call .\RI\BatteryControl.bat")
         except Exception as e:
             self.log(f"Error : {e}")
@@ -1455,6 +1559,7 @@ class ODM_RunIn_Project(BaseRunInApp):
         finally:
             self.exec_cmd_wait(f"{tool_path} battery --mode auto", capture_log=True)
             self.exec_cmd_wait(f"{tool_path} fan --mode auto", capture_log=True)
+
 if __name__ == "__main__":
     try:
         hwnd = ctypes.windll.kernel32.GetConsoleWindow()
